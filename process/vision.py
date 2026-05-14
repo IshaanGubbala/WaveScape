@@ -16,6 +16,12 @@ except ImportError:
     CV2_AVAILABLE = False
 
 try:
+    import onnxruntime as _ort
+    ORT_AVAILABLE = True
+except ImportError:
+    ORT_AVAILABLE = False
+
+try:
     from picamera2 import Picamera2
     PICAMERA2_AVAILABLE = True
 except ImportError:
@@ -79,6 +85,8 @@ class VisionProcessor:
         # ONNX at 96px is less accurate → lower conf threshold to catch more objects
         self._conf = 0.10 if str(model_size).endswith(".onnx") else 0.15
         self._model = None
+        self._ort_session = None   # direct ORT session for .onnx (bypasses ultralytics)
+        self._ort_names: dict = {} # class id -> name, parsed from ONNX metadata
         self._cap = None
         self._picam = None
         self._prev_gray = None
@@ -95,9 +103,32 @@ class VisionProcessor:
     def _load_model(self):
         if not CV2_AVAILABLE:
             raise RuntimeError("opencv + ultralytics not installed")
-        if self._model is None:
-            # NCNN models are a directory ending in _ncnn_model
-            self._model = YOLO(self.model_size, task="detect")
+        if self._model is None and self._ort_session is None:
+            if str(self.model_size).endswith(".onnx") and ORT_AVAILABLE:
+                # Bypass ultralytics wrapper: create ORT session with full optimizations.
+                # Ultralytics passes no SessionOptions, leaving graph_optimization_level at
+                # ORT_ENABLE_BASIC. ORT_ENABLE_ALL adds constant folding, node fusion, and
+                # memory layout optimizations — measurable on repeated inference calls.
+                opts = _ort.SessionOptions()
+                opts.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                opts.execution_mode = _ort.ExecutionMode.ORT_SEQUENTIAL
+                opts.intra_op_num_threads = 2  # match taskset -c 0,1
+                opts.inter_op_num_threads = 1
+                self._ort_session = _ort.InferenceSession(
+                    str(self.model_size),
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"],
+                )
+                # Parse class names from ONNX metadata (stored as Python dict literal)
+                import onnx as _onnx, ast as _ast
+                _m = _onnx.load(str(self.model_size))
+                for prop in _m.metadata_props:
+                    if prop.key == "names":
+                        self._ort_names = _ast.literal_eval(prop.value)
+                        break
+                print(f"  [YOLO] ORT session: ORT_ENABLE_ALL, intra_threads=2, {len(self._ort_names)} classes")
+            else:
+                self._model = YOLO(self.model_size, task="detect")
             if self.async_yolo:
                 self._yolo_thread = threading.Thread(target=self._yolo_worker, daemon=True)
                 self._yolo_thread.start()
@@ -113,6 +144,8 @@ class VisionProcessor:
                 self._yolo_busy = False
 
     def _run_yolo_sync(self, frame: np.ndarray) -> list[dict]:
+        if self._ort_session is not None:
+            return self._run_yolo_ort(frame)
         results = self._model(frame, imgsz=self.imgsz, verbose=False, conf=self._conf)
         detections = []
         for r in results:
@@ -132,6 +165,45 @@ class VisionProcessor:
                     "distance_m": estimate_distance(label, w),
                     "bbox": [round(x1), round(y1), round(x2), round(y2)],
                 })
+        return detections
+
+    def _run_yolo_ort(self, frame: np.ndarray) -> list[dict]:
+        """Direct ORT inference — no ultralytics Python overhead.
+        Input: BGR frame at any size (resized internally to self.imgsz).
+        Output: [x1,y1,x2,y2,conf,class_id] in IMG_W/IMG_H coord space.
+        Model end2end=True: output already post-NMS, 189 slots, filter by conf."""
+        # Preprocess: BGR->RGB, resize to model input, NCHW float32 [0,1]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if rgb.shape[:2] != (self.imgsz, self.imgsz):
+            rgb = cv2.resize(rgb, (self.imgsz, self.imgsz))
+        inp = rgb.astype(np.float32) * (1.0 / 255.0)
+        inp = inp.transpose(2, 0, 1)[np.newaxis]  # (1,3,H,W)
+
+        raw = self._ort_session.run(None, {"images": inp})[0][0]  # (189, 6)
+
+        # Scale factor from model coords (imgsz) back to display coords (IMG_W/H)
+        sx = IMG_W / self.imgsz
+        sy = IMG_H / self.imgsz
+
+        detections = []
+        for row in raw:
+            x1, y1, x2, y2, conf, cls_f = row
+            if conf < self._conf:
+                continue
+            label = self._ort_names.get(int(cls_f), "unknown")
+            if label not in THREAT_CLASSES:
+                continue
+            x1s, y1s = x1 * sx, y1 * sy
+            x2s, y2s = x2 * sx, y2 * sy
+            cx = (x1s + x2s) / 2
+            w = x2s - x1s
+            detections.append({
+                "label": label,
+                "confidence": round(float(conf), 3),
+                "direction_deg": round(bbox_to_direction(cx), 1),
+                "distance_m": estimate_distance(label, w),
+                "bbox": [round(x1s), round(y1s), round(x2s), round(y2s)],
+            })
         return detections
 
     def _propagate(self, dets: list[dict], flow: np.ndarray) -> list[dict]:
