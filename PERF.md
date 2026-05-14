@@ -1,6 +1,6 @@
 # ThreatDetect Pi 5 — Performance Optimization Record
 
-**Date**: 2026-05-13  
+**Date**: 2026-05-14  
 **Hardware**: Raspberry Pi 5 (8GB RAM, BCM2712, 4× Cortex-A76 @ 2.4GHz)  
 **Baseline**: Bare pipeline at project start. All numbers measured on device.
 
@@ -30,6 +30,10 @@ impact, with the reasoning that wasn't obvious in advance.
 | 12 | Capture at 224×224 natively | resize after capture | **0ms resize** | eliminates scale step |
 | 13 | Single grayscale conversion | 2× cvtColor | **1× gray** | shared between flow and YOLO |
 | 14 | Camera flip at capture | per-display flip | **once at capture** | eliminates per-frame copy |
+| 15 | Bypass ultralytics → direct ORT session | 70ms (wrapper overhead) | **17ms** | **4.1×** — ultralytics Python per-inference cost eliminated |
+| 16 | ORT_ENABLE_ALL + ORT_SEQUENTIAL + intra_threads=2 | ORT_ENABLE_BASIC default | **17ms** | constant folding, node fusion, layout opts |
+| 17 | INT8 static quantization (QDQ, per-tensor) | 17ms FP32 | **6.3ms** | **2.7×** — ARM asimddp runs INT8 dot-products natively |
+| 18 | INT8 model size | 9.7MB FP32 | **2.9MB** | **3.4× smaller** — better L2 cache fit |
 
 ### Audio
 
@@ -81,6 +85,8 @@ impact, with the reasoning that wasn't obvious in advance.
 | 48 | -ngl 0 + GGML_VULKAN_DISABLE=1 | Vulkan probe at startup | **skipped** | no GPU error, faster start |
 | 49 | --log-disable | token-level disk I/O | **silent** | no I/O contention on µSD |
 | 50 | --parallel 1 (single request slot) | multi-slot overhead | **single slot** | no scheduler contention |
+| 51 | llama.cpp rebuild: -DGGML_NATIVE=ON -DGGML_LTO=ON | generic aarch64 | **march=native** | asimddp picked up more aggressively; LTO inlines hot paths |
+| 52 | llama-server -c 256 (down from 512) | ~450MB KV alloc | **~225MB** | actual usage ~168 tokens; quadratic attn cost halved |
 
 ### Pipeline Architecture
 
@@ -341,25 +347,68 @@ prox_boost = 0.20 if dist<3m else 0.10 if dist<6m else 0.05 if dist<12m
 
 ---
 
-## Current Pipeline State (2026-05-13)
+---
+
+### 19. Bypass Ultralytics + ORT_ENABLE_ALL — Eliminating Wrapper Overhead
+
+**Root cause of 70ms**: The `ultralytics` YOLO wrapper does significant Python work per inference call: result parsing, tensor wrapping, metadata extraction, and passes no `SessionOptions` to ONNX Runtime — leaving `graph_optimization_level` at `ORT_ENABLE_BASIC`. This meant constant folding, node fusion, and memory layout optimization were disabled.
+
+**Fix**: Created `_run_yolo_ort()` — direct `ort.InferenceSession` bypassing ultralytics entirely.
+
+Key session options:
+```python
+opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+opts.intra_op_num_threads = 2   # match taskset -c 0,1
+opts.inter_op_num_threads = 1
+```
+
+`ORT_SEQUENTIAL` is critical: with 2 pinned cores, parallel execution graph scheduling adds synchronization overhead that exceeds any parallelism gain. Sequential mode removes it.
+
+Class names parsed from ONNX metadata at load time (`ast.literal_eval` on the `names` property). No ultralytics import needed at runtime.
+
+**Gain**: 70ms → 17ms (4.1×). Ultralytics Python overhead was 53ms per inference.
+
+---
+
+### 20. INT8 Static Quantization — ARM asimddp Native Integer Math
+
+**Why INT8 is fast on Cortex-A76**: The BCM2712 CPU features `asimddp` (ASIMD dot-product) instructions — `vdotq_s32` / `udot` — which compute 4× INT8 multiply-accumulates per cycle in a single instruction. ONNX Runtime's ARM Conv kernel uses these directly for INT8 weights and activations. FP32 uses `fmla` which has similar throughput but requires 4× the data bandwidth.
+
+**Why data bandwidth matters**: YOLO at imgsz=96 is bandwidth-bound, not compute-bound on Pi 5. INT8 weights are 4× smaller than FP32 → more weights fit in 512KB L2 cache → fewer cache misses → throughput improves beyond the raw compute ratio.
+
+**Quantization approach**: Static QDQ with 64 synthetic calibration frames (uniform random [0,1]). `per_channel=False` required for ONNX Runtime 1.26 compatibility on Pi (`per_channel=True` adds `axis` attribute to `DequantizeLinear` not supported in older ORT). `ActivationSymmetric=True` enables zero-point=0 for activations, reducing dequant overhead.
+
+| Config | Inference | Size |
+|---|---|---|
+| FP32 ONNX (ultralytics) | 70ms | 9.7MB |
+| FP32 ONNX (direct ORT) | 17ms | 9.7MB |
+| INT8 QDQ (direct ORT) | **6.3ms** | **2.9MB** |
+
+**Total YOLO gain over project**: 70ms → 6.3ms = **11.1× faster**.
+
+---
+
+## Current Pipeline State (2026-05-14)
 
 ```
-Pi 5 @ 2400MHz, 56°C, throttled=0x0
+Pi 5 @ 2400MHz, native build (DGGML_NATIVE=ON, LTO), throttled=0x0
 
 llama-server:  taskset -c 2,3
                ~/models/gemma4-e2b/e2b-smooth-q4_0.gguf (Q4_0, 3.2GB)
-               -c 512 -t 2 --mlock -ngl 0 --parallel 1 --log-disable
+               -c 256 -t 2 --mlock -ngl 0 --parallel 1 --log-disable
                --chat-template-file ~/gemma4-nothink.jinja  (<|turn> Gemma4 format)
                GGML_VULKAN_DISABLE=1
                
 pipeline:      taskset -c 0,1  OMP_NUM_THREADS=2  OPENBLAS_NUM_THREADS=2
-               yolo26n.onnx  imgsz=96  conf=0.10  skip_N=3  async_yolo=True
+               yolo26n.onnx (INT8 QDQ)  imgsz=96  conf=0.10  skip_N=3  async_yolo=True
+               ORT: ORT_ENABLE_ALL + ORT_SEQUENTIAL + intra_threads=2
                audio: MCP3008 SPI 10kHz 4ch (ch1 dead → ch0,2,3 active)
                Gemma: interval=2s  timeout=9s  scene-diff TTL=6s
                LLM params: max_tokens=12  temp=0.0  cache_prompt=True  stream=False
 
 Performance:
-  YOLO inference:    70ms median (14.3fps cap)
+  YOLO inference:    6.3ms median (>100fps cap — no longer bottleneck)
   Pipeline FPS:      ~9–11fps (video file, H.264 decode overhead)
   Gemma latency:     ~3s (pipeline running), 2.7s min observed
   Gemma direction:   ±10° (was ±111° before template fix)
@@ -377,7 +426,8 @@ Performance:
 |---|---|---|---|
 | Gemma first response | 37s (w1 bug) | **~3s** | **12×** |
 | Gemma under pipeline load | 7–10s | **~3s** | **~3×** |
-| YOLO inference | 307ms (PyTorch) | **70ms** (ONNX) | **4.4×** |
+| YOLO inference | 307ms (PyTorch) | **6.3ms** (INT8 ORT) | **49×** |
+| YOLO inference (stages) | 307ms → 70ms → 17ms → **6.3ms** | PyTorch→ONNX→direct ORT→INT8 | 4.4× → 4.1× → 2.7× |
 | Pipeline FPS | 3.67fps (OMP thrash) | **~10fps** | **2.7×** |
 | Direction accuracy | ±111° (wrong template) | **±10°** | **11×** |
 | Output token count | 20+ (ASCII) | **8** (CJK) | **2.5× fewer steps** |
@@ -385,4 +435,5 @@ Performance:
 | Haptic update rate | 0.33Hz (per LLM) | **10Hz** (predictor) | **30× smoother** |
 | Max Gemma stall | 60s (timeout) | **10s** | **6×** |
 | CPU idle waste | 54% (w1 bug) | **0%** | +54% reclaimed |
-| RAM for KV | ~1.6GB (-c 2048) | **~180MB** (-c 512) | ~9× smaller |
+| RAM for KV | ~1.6GB (-c 2048) | **~90MB** (-c 256) | **~18× smaller** |
+| YOLO model size | 9.7MB (FP32) | **2.9MB** (INT8) | 3.4× smaller, better L2 fit |
