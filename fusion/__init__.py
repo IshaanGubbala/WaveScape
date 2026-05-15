@@ -11,3 +11,4 @@ from .inference_profile import (
 )
 from .lsai import LogitSteerer
 from .spatial_mapper import SpatialMapper, SpatialMap, SPATIAL_UPDATE_INTERVAL
+from .stereo_depth import StereoDepthEstimator

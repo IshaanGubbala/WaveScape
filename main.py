@@ -18,6 +18,7 @@ from fusion import (
     CascadeRouter, SensorSnapshot,
     ThreatAnticipator, ANTICIPATION_THRESHOLD,
     SpatialMapper, SpatialMap,
+    StereoDepthEstimator,
 )
 from fusion.tracker import ObjectTracker
 from output.haptic import HapticController
@@ -126,6 +127,8 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
     predictor = ThreatPredictor(haptic_cb, update_hz=TARGET_FPS)
     predictor.start()
 
+    stereo = StereoDepthEstimator() if dual_cam else None
+
     # Video file source (overrides camera)
     _video_cap = None
     if video_path:
@@ -191,6 +194,22 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                 web_ui.update_frame(0, frame0, detections)
                 if frame1 is not None:
                     web_ui.update_frame(1, frame1, detections)
+                    # Stereo depth every other frame (SGBM ~30ms on Pi)
+                    if stereo is not None and frame_count % 2 == 0:
+                        sdepth = stereo.compute(frame0, frame1)
+                        if sdepth["min_depth_m"] < 1.5:
+                            haptic_fire(
+                                sdepth["escape_dir_deg"], "high",
+                                1.0 - sdepth["min_depth_m"] / 1.5,
+                                "STEREO",
+                            )
+                        if frame_count % 20 == 0:
+                            sectors = " ".join(
+                                f"{'.' if s['safe'] else 'X'}{s['angle_deg']:.0f}°={s['min_depth_m']:.1f}m"
+                                for s in sdepth["sector_depths"]
+                            )
+                            print(f"    [stereo] escape={sdepth['escape_dir_deg']:.0f}° "
+                                  f"min={sdepth['min_depth_m']:.2f}m {sdepth['latency_ms']:.0f}ms | {sectors}")
             else:
                 frame = vision.read_frame()
                 if frame is None:
