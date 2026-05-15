@@ -38,6 +38,18 @@ TARGET_FPS = 10
 _haptic = HapticController()
 
 
+def _sim_stereo_frame(frame: np.ndarray, shift_px: int = 5) -> np.ndarray:
+    """Synthesize fake right-camera frame by shifting left.
+    shift_px=5 at 96px → disparity≈5 → depth≈0.96m (triggers obstacle haptic).
+    Exposed border filled with edge column to avoid SGBM artifacts."""
+    import cv2 as _cv2
+    import numpy as _np
+    f = _cv2.resize(frame, (96, 96))
+    shifted = _np.roll(f, -shift_px, axis=1)
+    shifted[:, -shift_px:] = shifted[:, -shift_px - 1 : -shift_px]
+    return shifted
+
+
 def _infer_pattern(direction_deg: float, urgency: str, llm_pattern: str) -> str:
     """Fall back to direction-based pattern when LLM outputs 'none'.
     Boundaries: ±22.5° around forward/behind = center; otherwise left/right.
@@ -62,7 +74,7 @@ def haptic_fire(direction: float, urgency: str, confidence: float, source: str =
     web_ui.log_haptic(source, direction, urgency, confidence, effective_pattern)
 
 
-def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, video_path: str = None):
+def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, video_path: str = None, stereo_sim: bool = False):
     import platform
     _default_model = "/Users/ishaangubbala/Documents/airesearch/yolov8n.pt" if platform.system() == "Darwin" else "yolo26n.pt"
     _yolo = yolo_model or _default_model
@@ -127,7 +139,7 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
     predictor = ThreatPredictor(haptic_cb, update_hz=TARGET_FPS)
     predictor.start()
 
-    stereo = StereoDepthEstimator() if dual_cam else None
+    stereo = StereoDepthEstimator() if (dual_cam or stereo_sim) else None
 
     # Video file source (overrides camera)
     _video_cap = None
@@ -180,6 +192,18 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                 if tier >= 1 and detections:
                     d = max(detections, key=lambda x: x["confidence"])
                     haptic_fire(d["direction_deg"], "high", d["confidence"], "TIER1")
+                if stereo_sim and stereo is not None and frame_count % 2 == 0:
+                    sdepth = stereo.compute(frame, _sim_stereo_frame(frame))
+                    if sdepth["min_depth_m"] < 1.5:
+                        haptic_fire(sdepth["escape_dir_deg"], "high",
+                                    1.0 - sdepth["min_depth_m"] / 1.5, "STEREO")
+                    if frame_count % 20 == 0:
+                        sectors = " ".join(
+                            f"{'.' if s['safe'] else 'X'}{s['angle_deg']:.0f}°={s['min_depth_m']:.1f}m"
+                            for s in sdepth["sector_depths"]
+                        )
+                        print(f"    [stereo-sim] escape={sdepth['escape_dir_deg']:.0f}° "
+                              f"min={sdepth['min_depth_m']:.2f}m {sdepth['latency_ms']:.0f}ms | {sectors}")
                 if spatial_mapper.should_update(beam_scan):
                     print(f"\n  [frame {frame_count:4d}] SPATIAL → Gemma")
                     spatial_mapper.update(detections, beam_scan, frame=frame, heading_deg=0.0,
@@ -294,6 +318,8 @@ if __name__ == "__main__":
     parser.add_argument("--ui", action="store_true", help="Launch Gradio web dashboard on port 7860")
     parser.add_argument("--yolo-model", default=None, help="YOLO model path (default: yolo26n.pt on Pi, yolov8n.pt on Mac)")
     parser.add_argument("--video", default=None, help="Path to video file (loops); overrides camera input")
+    parser.add_argument("--stereo-sim", action="store_true",
+                        help="Simulate stereo by shifting each frame 5px; tests depth pipeline without dual cam")
     args = parser.parse_args()
 
     import fusion.spatial_mapper as sm
@@ -305,4 +331,4 @@ if __name__ == "__main__":
         t.start()
         print("  web UI: http://0.0.0.0:7860")
 
-    main(mock=not args.real, dual_cam=args.dual_cam, yolo_model=args.yolo_model, video_path=args.video)
+    main(mock=not args.real, dual_cam=args.dual_cam, yolo_model=args.yolo_model, video_path=args.video, stereo_sim=args.stereo_sim)
