@@ -153,6 +153,10 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
     print(f"\nRunning at {TARGET_FPS}fps sensor loop. Ctrl+C to stop.\n")
     frame_count = 0
     interval = 1.0 / TARGET_FPS
+    import collections as _col
+    _frame_times = _col.deque(maxlen=30)
+    _last_yolo_ms = 0.0
+    _last_stereo_ms = 0.0
 
     try:
         while True:
@@ -170,6 +174,7 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                 import cv2 as _cv2
                 from process.vision import IMG_W, IMG_H
                 frame = _cv2.resize(frame, (IMG_W, IMG_H))
+                _t_frame_start = time.monotonic()
                 detections, flow = vision.process_frame(frame)
                 web_ui.update_frame(0, frame, detections)
                 web_ui.update_yolo_live(detections)
@@ -194,6 +199,8 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                     haptic_fire(d["direction_deg"], "high", d["confidence"], "TIER1")
                 if stereo_sim and stereo is not None and frame_count % 2 == 0:
                     sdepth = stereo.compute(frame, _sim_stereo_frame(frame))
+                    _last_stereo_ms = sdepth.get("latency_ms", 0.0)
+                    web_ui.update_stereo(sdepth)
                     if sdepth["min_depth_m"] < 1.5:
                         haptic_fire(sdepth["escape_dir_deg"], "high",
                                     1.0 - sdepth["min_depth_m"] / 1.5, "STEREO")
@@ -204,6 +211,10 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                         )
                         print(f"    [stereo-sim] escape={sdepth['escape_dir_deg']:.0f}° "
                               f"min={sdepth['min_depth_m']:.2f}m {sdepth['latency_ms']:.0f}ms | {sectors}")
+                _frame_ms = (time.monotonic() - _t_frame_start) * 1000
+                _frame_times.append(_frame_ms)
+                _fps = 1000.0 / (sum(_frame_times) / len(_frame_times)) if _frame_times else 0.0
+                web_ui.update_perf(_frame_ms, _fps, yolo_ms=0.0, stereo_ms=_last_stereo_ms)
                 if spatial_mapper.should_update(beam_scan):
                     print(f"\n  [frame {frame_count:4d}] SPATIAL → Gemma")
                     spatial_mapper.update(detections, beam_scan, frame=frame, heading_deg=0.0,
@@ -221,6 +232,8 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                     # Stereo depth every other frame (SGBM ~30ms on Pi)
                     if stereo is not None and frame_count % 2 == 0:
                         sdepth = stereo.compute(frame0, frame1)
+                        _last_stereo_ms = sdepth.get("latency_ms", 0.0)
+                        web_ui.update_stereo(sdepth)
                         if sdepth["min_depth_m"] < 1.5:
                             haptic_fire(
                                 sdepth["escape_dir_deg"], "high",
@@ -298,7 +311,10 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                 )
                 predictor.update_motion(motion)
 
-            pass  # no fps cap
+            _frame_ms = (time.monotonic() - t0) * 1000
+            _frame_times.append(_frame_ms)
+            _fps = 1000.0 / (sum(_frame_times) / len(_frame_times)) if _frame_times else 0.0
+            web_ui.update_perf(_frame_ms, _fps, stereo_ms=_last_stereo_ms)
 
     except KeyboardInterrupt:
         predictor.stop()
