@@ -1,21 +1,30 @@
 """
 GPIO haptic motor driver using lgpio (Pi 5 native).
-Left temple: GPIO 24  Right temple: GPIO 25
+4 motors in X formation:
+  GPIO 22 = front-left  (315°)
+  GPIO 23 = front-right ( 45°)
+  GPIO 24 = back-left   (225°)
+  GPIO 25 = back-right  (135°)
 (GPIO 18/19/20 reserved for I2S mic array; GPIO 12/13 for cooling fan)
 Falls back to console print on non-Pi platforms.
 """
-import time
+import math
 import threading
 
-GPIO_LEFT = 24
-GPIO_RIGHT = 25
-PWM_FREQ_HZ = 200
+# X-formation motor layout: (gpio_pin, angle_deg)
+MOTORS = [
+    (22, 315),  # front-left
+    (23,  45),  # front-right
+    (24, 225),  # back-left
+    (25, 135),  # back-right
+]
+PWM_FREQ_HZ = 100
 
 try:
     import lgpio
     _chip = lgpio.gpiochip_open(0)
-    lgpio.gpio_claim_output(_chip, GPIO_LEFT)
-    lgpio.gpio_claim_output(_chip, GPIO_RIGHT)
+    for _pin, _ in MOTORS:
+        lgpio.gpio_claim_output(_chip, _pin)
     GPIO_AVAILABLE = True
 except Exception:
     GPIO_AVAILABLE = False
@@ -37,6 +46,8 @@ PATTERN_DURATION = {
     "rapid_center": 0.6,
 }
 
+_MOTOR_LABELS = ["FL", "FR", "BL", "BR"]
+
 
 class HapticController:
     def __init__(self):
@@ -49,47 +60,43 @@ class HapticController:
         if duty == 0:
             return
 
-        right_bias = self._direction_to_split(direction_deg)
-        left_duty = round(duty * (1.0 - right_bias))
-        right_duty = round(duty * right_bias)
+        duties = self._direction_to_duties(direction_deg, duty)
 
         with self._lock:
             if self._active_timer:
                 self._active_timer.cancel()
-            self._set_motors(left_duty, right_duty)
+            self._set_motors(duties)
             if duration > 0:
                 self._active_timer = threading.Timer(duration, self._stop_motors)
                 self._active_timer.daemon = True
                 self._active_timer.start()
 
         if not GPIO_AVAILABLE:
-            side = "LEFT " if direction_deg > 180 else "RIGHT"
-            bar = "█" * (duty // 10)
-            print(f"  [HAPTIC   ] {side} dir={direction_deg:5.1f}° {urgency:8s} {bar} pat={pattern}")
+            bar_parts = " ".join(f"{_MOTOR_LABELS[i]}={'█' * (d // 10):<10}" for i, d in enumerate(duties))
+            print(f"  [HAPTIC   ] dir={direction_deg:5.1f}° {urgency:8s} {bar_parts} pat={pattern}")
 
-    def _direction_to_split(self, deg: float) -> float:
-        """Right-motor fraction 0.0–1.0. Smooth piecewise-linear around compass:
-        0°=0.5 (50/50), 90°=1.0 (all R), 180°=0.5 (50/50), 270°=0.0 (all L), 360°=0.5.
-        Continuous across 270→360 boundary."""
-        deg = deg % 360
-        if deg <= 90:
-            return 0.5 + (deg / 90) * 0.5
-        elif deg <= 180:
-            return 1.0 - ((deg - 90) / 90) * 0.5
-        elif deg <= 270:
-            return 0.5 - ((deg - 180) / 90) * 0.5
-        else:
-            return ((deg - 270) / 90) * 0.5
+    def _direction_to_duties(self, direction_deg: float, max_duty: int) -> list[int]:
+        """Cosine activation over 4 X-formation motors.
+        Each motor fires proportional to max(0, cos(direction - motor_angle)).
+        Normalised so the sum always equals max_duty."""
+        rad = math.radians(direction_deg)
+        weights = []
+        for _, angle in MOTORS:
+            motor_rad = math.radians(angle)
+            w = max(0.0, math.cos(rad - motor_rad))
+            weights.append(w)
+        total = sum(weights) or 1.0
+        return [round(max_duty * w / total) for w in weights]
 
-    def _set_motors(self, left_duty: int, right_duty: int) -> None:
+    def _set_motors(self, duties: list[int]) -> None:
         if GPIO_AVAILABLE and _chip is not None:
-            lgpio.tx_pwm(_chip, GPIO_LEFT, PWM_FREQ_HZ, left_duty)
-            lgpio.tx_pwm(_chip, GPIO_RIGHT, PWM_FREQ_HZ, right_duty)
+            for (pin, _), duty in zip(MOTORS, duties):
+                lgpio.tx_pwm(_chip, pin, PWM_FREQ_HZ, duty)
 
     def _stop_motors(self) -> None:
         if GPIO_AVAILABLE and _chip is not None:
-            lgpio.tx_pwm(_chip, GPIO_LEFT, 0, 0)
-            lgpio.tx_pwm(_chip, GPIO_RIGHT, 0, 0)
+            for pin, _ in MOTORS:
+                lgpio.tx_pwm(_chip, pin, 0, 0)
 
     def cleanup(self) -> None:
         self._stop_motors()

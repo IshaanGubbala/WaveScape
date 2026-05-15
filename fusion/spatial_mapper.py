@@ -11,7 +11,7 @@ import requests
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-LLAMA_URL = "http://localhost:8081"
+LLAMA_URL = "http://192.168.68.65:8081"  # Mac Metal (LAN offload, ~160ms vs ~5s Pi CPU)
 SPATIAL_UPDATE_INTERVAL = 2.0  # CJK fine-tune ~1.5s/call on Pi
 GEMMA_TIMEOUT_S = 10.0          # force-release busy lock after this many seconds
 GEMMA_HTTP_TIMEOUT = 9.0        # HTTP request timeout (slightly under busy timeout)
