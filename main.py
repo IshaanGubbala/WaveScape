@@ -38,7 +38,7 @@ TARGET_FPS = 10
 _haptic = HapticController()
 
 
-def _sim_stereo_frame(frame: np.ndarray, shift_px: int = 5) -> np.ndarray:
+def _sim_stereo_frame(frame, shift_px: int = 5):
     """Synthesize fake right-camera frame by shifting left.
     shift_px=5 at 96px → disparity≈5 → depth≈0.96m (triggers obstacle haptic).
     Exposed border filled with edge column to avoid SGBM artifacts."""
