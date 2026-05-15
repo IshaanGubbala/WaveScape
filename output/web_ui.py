@@ -1100,11 +1100,17 @@ span.svelte-1gfkn6j {
 }
 
 #td-main-grid {
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 0.9fr);
 }
 
 #td-secondary-grid {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+#td-stats-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
 }
 
 .td-panel {
@@ -1185,7 +1191,7 @@ span.svelte-1gfkn6j {
 #td-radar-feed img {
   display: block;
   width: 100% !important;
-  height: 318px !important;
+  height: 360px !important;
   object-fit: cover;
 }
 
@@ -1483,28 +1489,15 @@ span.svelte-1gfkn6j {
   #td-nav,
   #td-main-grid,
   #td-secondary-grid,
+  #td-stats-strip,
   .td-motor-grid,
-  .td-threat-row,
-  .td-board-grid {
-    grid-template-columns: 1fr;
-  }
-
-  #td-nav,
-  #td-hero {
-    align-items: flex-start;
-  }
-
-  #td-hero {
+  .td-threat-row {
     grid-template-columns: 1fr;
   }
 
   #td-video-feed img,
   #td-radar-feed img {
     height: 250px !important;
-  }
-
-  .td-board-shell {
-    padding: 16px;
   }
 }
 
@@ -1545,60 +1538,16 @@ _SHELL_OPEN_HTML = """
     </div>
     <div class="td-live"><div class="td-live-dot"></div>Live pipeline</div>
   </header>
-
-  <section id="td-hero">
-    <div class="td-hero-copy">
-      <div class="td-eyebrow">Light mode first · Apple-clean · subtle cyber</div>
-      <h1>Real-time spatial awareness with a cleaner interface.</h1>
-      <p>
-        Camera, spatial radar, audio beams, and haptic feedback are organized as compact surfaces
-        so the signal reads fast and the interface stays calm.
-      </p>
-      <div class="td-chip-row">
-        <span class="td-chip">Vision feed</span>
-        <span class="td-chip">Audio beams</span>
-        <span class="td-chip">Spatial map</span>
-        <span class="td-chip">Haptic response</span>
-      </div>
-    </div>
-    <div class="td-hero-board">
-      <div class="td-board-shell">
-        <div class="td-board-top">
-          <span>System view</span>
-          <span>Live synced</span>
-        </div>
-        <div class="td-board-title">Signal board</div>
-        <div class="td-board-copy">
-          A compact readout of what the system is seeing, hearing, and routing into haptics.
-        </div>
-        <div class="td-board-grid">
-          <div class="td-mini-tile">
-            <span>Camera</span>
-            <strong>Fast frame loop</strong>
-            <small>High-contrast stream</small>
-          </div>
-          <div class="td-mini-tile">
-            <span>Audio</span>
-            <strong>Beam scan</strong>
-            <small>Directional energy map</small>
-          </div>
-          <div class="td-mini-tile">
-            <span>Output</span>
-            <strong>Haptic routing</strong>
-            <small>Left/right motor split</small>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
+  <section id="td-stats-strip">
 """
 
-_MAIN_GRID_OPEN_HTML = """
+_STATS_CLOSE_MAIN_OPEN_HTML = """
+  </section>
   <section id="td-main-grid">
     <section class="td-panel" id="td-video-card">
       <div class="td-card-head">
         <span>Camera stream</span>
-        <span>YOLO v8</span>
+        <span>YOLO v8 · ONNX</span>
       </div>
       <div class="td-card-body">
 """
@@ -1606,7 +1555,6 @@ _MAIN_GRID_OPEN_HTML = """
 _MAIN_GRID_SEP_HTML = """
       </div>
     </section>
-
     <section class="td-panel" id="td-radar-card">
       <div class="td-card-head">
         <span>Spatial radar</span>
@@ -1615,14 +1563,24 @@ _MAIN_GRID_SEP_HTML = """
       <div class="td-card-body">
 """
 
+_MAIN_GRID_SEP2_HTML = """
+      </div>
+    </section>
+    <section class="td-panel td-copy-card" id="td-nav-card">
+      <div class="td-card-body" style="padding-top:0">
+"""
+
 _MAIN_GRID_CLOSE_HTML = """
       </div>
     </section>
   </section>
+  <section id="td-secondary-grid">
 """
 
-_SECONDARY_GRID_OPEN_HTML = """
-  <section id="td-secondary-grid">
+_SECONDARY_SEP1_HTML = """
+"""
+
+_SECONDARY_SEP2_HTML = """
 """
 
 _SECONDARY_GRID_CLOSE_HTML = """
@@ -1630,7 +1588,7 @@ _SECONDARY_GRID_CLOSE_HTML = """
 """
 
 _FOOTER_HTML = """
-  <div class="td-footer">ThreatDetect live dashboard · light mode UI.</div>
+  <div class="td-footer">ThreatDetect live dashboard · stereo nav enabled.</div>
 </div>
 """
 
@@ -1642,17 +1600,19 @@ def launch(server_name: str = "0.0.0.0", server_port: int = 7860, share: bool = 
     with gr.Blocks(title="ThreatDetect") as demo:
         gr.HTML(_SHELL_OPEN_HTML)
         stats = gr.HTML(_build_stats_html(), elem_id="td-stats-html")
-        gr.HTML(_MAIN_GRID_OPEN_HTML)
-        video = gr.Image(type="numpy", show_label=False, height=290, elem_id="td-video-feed")
+        gr.HTML(_STATS_CLOSE_MAIN_OPEN_HTML)
+        video = gr.Image(type="numpy", show_label=False, height=360, elem_id="td-video-feed")
         gr.HTML(_MAIN_GRID_SEP_HTML)
-        map_img = gr.Image(type="numpy", show_label=False, height=290, elem_id="td-radar-feed")
-        gr.HTML(_MAIN_GRID_CLOSE_HTML)
-        gr.HTML(_SECONDARY_GRID_OPEN_HTML)
-        audio_html = gr.HTML(_build_audio_html(), elem_id="td-audio-html")
-        haptic_html = gr.HTML(_build_haptic_html(), elem_id="td-haptic-html")
-        gr.HTML(_SECONDARY_GRID_CLOSE_HTML)
-        threats_html = gr.HTML(_build_threats_html(), elem_id="td-threats-html")
+        map_img = gr.Image(type="numpy", show_label=False, height=360, elem_id="td-radar-feed")
+        gr.HTML(_MAIN_GRID_SEP2_HTML)
         nav_html = gr.HTML(_build_nav_html(), elem_id="td-nav-html")
+        gr.HTML(_MAIN_GRID_CLOSE_HTML)
+        audio_html = gr.HTML(_build_audio_html(), elem_id="td-audio-html")
+        gr.HTML(_SECONDARY_SEP1_HTML)
+        haptic_html = gr.HTML(_build_haptic_html(), elem_id="td-haptic-html")
+        gr.HTML(_SECONDARY_SEP2_HTML)
+        threats_html = gr.HTML(_build_threats_html(), elem_id="td-threats-html")
+        gr.HTML(_SECONDARY_GRID_CLOSE_HTML)
         gr.HTML(_FOOTER_HTML)
         beep = gr.Audio(show_label=False, autoplay=True, visible=False)
         timer = gr.Timer(0.05)
