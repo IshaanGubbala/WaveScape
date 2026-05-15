@@ -49,15 +49,39 @@ def _px_col_to_deg(col: float) -> float:
     return (col / STEREO_W - 0.5) * 2 * CAM_HALF_FOV_DEG
 
 
+_CALIB_PATHS = [
+    "/home/ishaan/threatdetect/stereo_calib.npz",
+    "stereo_calib.npz",
+]
+
+
+def _load_calib() -> dict | None:
+    import os
+    for p in _CALIB_PATHS:
+        if os.path.exists(p):
+            d = dict(np.load(p))
+            print(f"  [stereo] loaded calibration: {p}  baseline={d['baseline_mm']:.1f}mm  rms={float(d['rms']):.3f}px")
+            return d
+    return None
+
+
 class StereoDepthEstimator:
     """
     One-shot stereo depth from a rectified (or approximately parallel) camera pair.
-    Stateless across frames — call compute() each time.
+    Loads stereo_calib.npz if available (produced by tools/calibrate_stereo.py).
+    Falls back to uncalibrated (assumes parallel cameras) if no file found.
     """
 
     def __init__(self, baseline_m: float = BASELINE_M):
-        self.baseline_m = baseline_m
         self._sgbm: object | None = None
+        self._calib = _load_calib()
+        if self._calib is not None:
+            self.baseline_m = float(self._calib["baseline_mm"]) / 1000.0
+            # Focal length from rectified projection matrix P0 (element [0,0])
+            self._focal_px = float(self._calib["P0"][0, 0]) * (STEREO_W / 224.0)
+        else:
+            self.baseline_m = baseline_m
+            self._focal_px = FOCAL_PX
 
     def _build(self):
         self._sgbm = cv2.StereoSGBM_create(
@@ -95,9 +119,24 @@ class StereoDepthEstimator:
         import time
         t0 = time.monotonic()
 
-        # Grayscale + resize to stereo resolution
-        gl = cv2.resize(cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY), (STEREO_W, STEREO_H))
-        gr = cv2.resize(cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY), (STEREO_W, STEREO_H))
+        # Resize to stereo resolution
+        f0 = cv2.resize(frame0, (STEREO_W, STEREO_H))
+        f1 = cv2.resize(frame1, (STEREO_W, STEREO_H))
+
+        # Apply rectification maps if calibration is loaded
+        if self._calib is not None:
+            sx = STEREO_W / 224.0
+            sy = STEREO_H / 224.0
+            # Scale maps from calibration resolution (224×224) to STEREO_W×STEREO_H
+            mx0 = self._calib["map0x"] * sx
+            my0 = self._calib["map0y"] * sy
+            mx1 = self._calib["map1x"] * sx
+            my1 = self._calib["map1y"] * sy
+            f0 = cv2.remap(f0, mx0.astype(np.float32), my0.astype(np.float32), cv2.INTER_LINEAR)
+            f1 = cv2.remap(f1, mx1.astype(np.float32), my1.astype(np.float32), cv2.INTER_LINEAR)
+
+        gl = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY)
+        gr = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
 
         # SGBM: 16-bit fixed-point output, divide by 16 for float disparity
         disp16 = self._sgbm.compute(gl, gr)
@@ -106,7 +145,7 @@ class StereoDepthEstimator:
         # Disparity → metric depth:  Z = f * B / d
         depth = np.zeros_like(disp)
         valid = disp > 0.5
-        depth[valid] = (FOCAL_PX * self.baseline_m) / disp[valid]
+        depth[valid] = (self._focal_px * self.baseline_m) / disp[valid]
         depth[(depth > 10.0) | (depth < 0.1)] = 0.0  # clamp to plausible range
 
         latency_ms = (time.monotonic() - t0) * 1000
