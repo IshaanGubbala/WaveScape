@@ -1,10 +1,10 @@
 """
 GPIO haptic motor driver using lgpio (Pi 5 native).
 4 motors in X formation:
-  GPIO 22 = front-left  (315°)
-  GPIO 23 = front-right ( 45°)
-  GPIO 24 = back-left   (225°)
-  GPIO 25 = back-right  (135°)
+  GPIO  6 = front-left  (315°)  physical pin 31
+  GPIO 16 = front-right ( 45°)  physical pin 36
+  GPIO 26 = back-right  (135°)  physical pin 37
+  GPIO 21 = back-left   (225°)  physical pin 40
 (GPIO 18/19/20 reserved for I2S mic array; GPIO 12/13 for cooling fan)
 Falls back to console print on non-Pi platforms.
 """
@@ -13,10 +13,10 @@ import threading
 
 # X-formation motor layout: (gpio_pin, angle_deg)
 MOTORS = [
-    (22, 315),  # front-left
-    (23,  45),  # front-right
-    (24, 225),  # back-left
-    (25, 135),  # back-right
+    ( 6, 315),  # front-left   pin 31
+    (16,  45),  # front-right  pin 36
+    (26, 135),  # back-right   pin 37
+    (21, 225),  # back-left    pin 40
 ]
 PWM_FREQ_HZ = 100
 
@@ -32,8 +32,8 @@ except Exception:
 
 URGENCY_DUTY = {
     "low": 0,
-    "medium": 40,
-    "high": 75,
+    "medium": 60,
+    "high": 100,
     "critical": 100,
 }
 
@@ -77,16 +77,16 @@ class HapticController:
 
     def _direction_to_duties(self, direction_deg: float, max_duty: int) -> list[int]:
         """Cosine activation over 4 X-formation motors.
-        Each motor fires proportional to max(0, cos(direction - motor_angle)).
-        Normalised so the sum always equals max_duty."""
+        Each motor scales to max(0, cos(direction - motor_angle)).
+        Normalised by peak weight so strongest motor always hits max_duty."""
         rad = math.radians(direction_deg)
         weights = []
         for _, angle in MOTORS:
             motor_rad = math.radians(angle)
             w = max(0.0, math.cos(rad - motor_rad))
             weights.append(w)
-        total = sum(weights) or 1.0
-        return [round(max_duty * w / total) for w in weights]
+        peak = max(weights) or 1.0
+        return [round(max_duty * w / peak) for w in weights]
 
     def _set_motors(self, duties: list[int]) -> None:
         if GPIO_AVAILABLE and _chip is not None:
@@ -96,7 +96,7 @@ class HapticController:
     def _stop_motors(self) -> None:
         if GPIO_AVAILABLE and _chip is not None:
             for pin, _ in MOTORS:
-                lgpio.tx_pwm(_chip, pin, 0, 0)
+                lgpio.tx_pwm(_chip, pin, PWM_FREQ_HZ, 0)
 
     def cleanup(self) -> None:
         self._stop_motors()

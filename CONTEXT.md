@@ -160,10 +160,11 @@ CascadeRouter (score = 0.5×vis + 0.25×aud + 0.15×motion + 0.1×pitch + prox_b
 | Module | Purpose |
 |--------|---------|
 | `haptic.py` | GPIO PWM via lgpio; GPIO 24=left, 25=right; direction→split mapping |
-| `web_ui.py` | Gradio dashboard: radar map + video feed + haptic log + mic beams |
+| `web_ui.py` | Gradio dashboard: light-mode hero board + radar map + video feed + haptic/audio cards |
 
 ### Web UI
 - Gradio at port 7860
+- Light-mode hero board with warm-white surfaces, teal accents, and stronger text contrast
 - Radar: 400×400px canvas, sweep animation, YOLO dots (hollow), Gemma objects (filled), beam wedges
 - Poll rate: 50ms (20fps)
 - Audio: stereo beep on haptic events (panned by direction)
@@ -301,16 +302,17 @@ llama-quantize e2b-smooth-f16.gguf e2b-smooth-q4_0.gguf Q4_0
 
 ---
 
-## Current Status (2026-05-13)
+## Current Status (2026-05-14)
 
 ### Working
 - Full pipeline: YOLO + MCP3008 audio + Gemma CJK spatial mapping + haptic output
 - Pi llama-server: Q4_0 + `<|turn>` template → CJK output, ±10° direction accuracy
 - ONNX YOLO: 70ms median, async thread, frame skip N=3 with flow propagation
 - MCP3008: ch0, ch2, ch3 active (ch1 dead, hardware fault). Beamforming functional.
-- Web UI: Gradio at port 7860, radar + video + haptic log
+- Web UI: Gradio at port 7860, light hero-board layout (video | radar, audio | haptic, threats)
 
 ### Known Issues
+- `llama-server` on port 8081 must be running separately; when it is down the UI still loads but Gemma-backed panels stay empty and the logs show connection refused.
 - **cam1 hardware timeout**: dual-cam mode fails because cam1 FPC connector is loose/damaged. Use single-cam (`--real`, no `--dual-cam`).
 - **MCP3008 ch1 dead**: hardware fault (stuck near rail). Auto-detected and zeroed on startup. Beamform uses 3 active channels.
 - **I2S INMP441**: software working, hardware SD wire fault. All I2S code in `~/dmic_fd/`. Not used.

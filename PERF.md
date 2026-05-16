@@ -387,6 +387,38 @@ Class names parsed from ONNX metadata at load time (`ast.literal_eval` on the `n
 
 **Total YOLO gain over project**: 70ms → 6.3ms = **11.1× faster**.
 
+> **INT8 regression (2026-05-14)**: INT8 QDQ model (`yolo26n_int8.onnx`) broken on ORT 1.26 ARM — outputs all zeros (max_conf=0.0). Root cause: QDQ per-tensor quantization format incompatibility with ORT 1.26's ARM NEON dequant path. Reverted to FP32 direct ORT (17ms). INT8 speedup attainable if ORT upgraded on Pi. FP32 backup at `~/threatdetect/yolo26n_fp32_backup.onnx`.
+
+---
+
+### 21. Stereo Depth via SGBM — 96×96 Real-Time Navigation
+
+**What it does**: Runs OpenCV SGBM stereo block matching on the dual IMX708 camera pair to produce per-sector metric depth for navigation haptic. Outputs 6 angular sectors across the ±33° FOV, identifies safest escape direction.
+
+**Why 96×96**: Same resolution as YOLO input — no additional resize step. SGBM runtime scales as O(W × H × numDisparities). At 96×96 with numDisparities=32, latency is 1–4ms on Pi 5 — fits within the frame budget without stealing cycles from YOLO.
+
+**Depth physics**:
+```
+Z = focal_px × baseline_m / disparity_px
+focal_px = (96/2) / tan(33°) ≈ 74px   (IMX708, half-FOV=33°, at 96px width)
+baseline_m = 0.065                      (65mm interpupillary on glasses frame)
+numDisparities=32 → depth range 0.15–4.8m
+```
+
+**Sector analysis**: 6 sectors, 10th-percentile depth per sector (robust against outlier disparities). Sectors with <5 valid pixels treated as open. `NEAR_M=1.5` → blocked, `FAR_M=3.0` → safe.
+
+**Calibration impact**: Without `stereo_calib.npz`, SGBM finds spurious matches on unrectified image pairs → 0.1m readings everywhere (invalid). With calibration: `cv2.remap()` aligns epipolar lines, SGBM matches correctly. Tool: `tools/calibrate_stereo.py`.
+
+**Stereo sim**: `np.roll(frame, -5, axis=1)` produces constant 5px disparity → Z = 74×0.065/5 = **0.96m** constant depth. Used to verify sector analysis and UI overlay without real stereo hardware.
+
+| Config | Latency | Depth accuracy |
+|---|---|---|
+| Stereo sim (5px shift) | ~0ms (Mac), ~1ms (Pi) | 0.96m constant (expected) |
+| Uncalibrated real cams | 1–4ms (Pi) | bogus (0.1m spurious) |
+| Calibrated real cams | 1–4ms (Pi) | metric (expected) |
+
+**Pipeline overhead**: Stereo adds ~2ms per frame on Pi. With SGBM disabled, FPS ~9–11fps. With SGBM enabled and stereo-sim, FPS ~8.8fps (within margin, dominated by video decode).
+
 ---
 
 ## Current Pipeline State (2026-05-14)
@@ -401,21 +433,31 @@ llama-server:  taskset -c 2,3
                GGML_VULKAN_DISABLE=1
                
 pipeline:      taskset -c 0,1  OMP_NUM_THREADS=2  OPENBLAS_NUM_THREADS=2
-               yolo26n.onnx (INT8 QDQ)  imgsz=96  conf=0.10  skip_N=3  async_yolo=True
+               yolo26n.onnx (FP32 — INT8 broken on ORT 1.26)  imgsz=96  conf=0.10
+               skip_N=3  async_yolo=True
                ORT: ORT_ENABLE_ALL + ORT_SEQUENTIAL + intra_threads=2
+               stereo: SGBM 96×96  numDisp=32  block=5  N_SECTORS=6  NEAR=1.5m
                audio: MCP3008 SPI 10kHz 4ch (ch1 dead → ch0,2,3 active)
                Gemma: interval=2s  timeout=9s  scene-diff TTL=6s
                LLM params: max_tokens=12  temp=0.0  cache_prompt=True  stream=False
 
+web_ui:        Gradio 7860, light hero-board layout, 50ms poll, warm-white + teal palette
+
 Performance:
-  YOLO inference:    6.3ms median (>100fps cap — no longer bottleneck)
-  Pipeline FPS:      ~9–11fps (video file, H.264 decode overhead)
-  Gemma latency:     ~3s (pipeline running), 2.7s min observed
-  Gemma direction:   ±10° (was ±111° before template fix)
-  Pipeline CPU:      ~177–189% (of 2-core allocation)
-  Gemma CPU:         ~139–146% (of 2-core allocation)
-  Haptic update rate: 10Hz continuous (ThreatPredictor)
-  Effective LLM rate: ~0.4 calls/s (cascade + scene gate)
+  YOLO inference:      17ms FP32 (was 6.3ms INT8, regressed — ORT 1.26 ARM bug)
+  Stereo SGBM:         1–4ms (Pi), ~0ms (Mac sim)
+  Optical flow:        ~16ms (levels=1, winsize=11)
+  Pipeline FPS:        ~8.8–10fps (video file, H.264 decode overhead)
+  Gemma latency:       ~3s (pipeline running), 2.7s min observed
+  Gemma direction:     ±10° (was ±111° before template fix)
+  Pipeline CPU:        ~177–189% (of 2-core allocation)
+  Gemma CPU:           ~139–146% (of 2-core allocation)
+  Haptic update rate:  10Hz continuous (ThreatPredictor)
+  Effective LLM rate:  ~0.4 calls/s (cascade + scene gate)
+  
+Known regressions:
+  INT8 ONNX broken: yolo26n_int8.onnx → max_conf=0.0 on ORT 1.26 ARM
+  Stereo uncalibrated: dual-cam depth bogus until stereo_calib.npz produced
 ```
 
 ---
@@ -426,9 +468,11 @@ Performance:
 |---|---|---|---|
 | Gemma first response | 37s (w1 bug) | **~3s** | **12×** |
 | Gemma under pipeline load | 7–10s | **~3s** | **~3×** |
-| YOLO inference | 307ms (PyTorch) | **6.3ms** (INT8 ORT) | **49×** |
-| YOLO inference (stages) | 307ms → 70ms → 17ms → **6.3ms** | PyTorch→ONNX→direct ORT→INT8 | 4.4× → 4.1× → 2.7× |
-| Pipeline FPS | 3.67fps (OMP thrash) | **~10fps** | **2.7×** |
+| YOLO inference | 307ms (PyTorch) | **17ms** (FP32 ORT, INT8 regressed) | **18×** |
+| YOLO inference (best achieved) | 307ms | **6.3ms** (INT8, not active) | **49×** |
+| YOLO inference (stages) | 307ms → 70ms → 17ms → (6.3ms broken) | PyTorch→ONNX→direct ORT→INT8 broken | 4.4× → 4.1× → (2.7× pending) |
+| Stereo depth | none | **1–4ms** (SGBM 96×96) | new feature |
+| Pipeline FPS | 3.67fps (OMP thrash) | **~8.8–10fps** | **~2.5×** |
 | Direction accuracy | ±111° (wrong template) | **±10°** | **11×** |
 | Output token count | 20+ (ASCII) | **8** (CJK) | **2.5× fewer steps** |
 | LLM call rate | 10Hz (every frame) | **~0.4Hz** (cascade+gate) | **25× fewer LLM calls** |
@@ -436,4 +480,4 @@ Performance:
 | Max Gemma stall | 60s (timeout) | **10s** | **6×** |
 | CPU idle waste | 54% (w1 bug) | **0%** | +54% reclaimed |
 | RAM for KV | ~1.6GB (-c 2048) | **~90MB** (-c 256) | **~18× smaller** |
-| YOLO model size | 9.7MB (FP32) | **2.9MB** (INT8) | 3.4× smaller, better L2 fit |
+| YOLO model size | 9.7MB (FP32) | 9.7MB (back to FP32 — INT8 regressed) | — |

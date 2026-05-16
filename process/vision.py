@@ -48,12 +48,28 @@ IMG_H = 224
 IMG_CENTER_X = IMG_W / 2
 
 
-def estimate_distance(label: str, bbox_w_px: float) -> float:
-    """Estimate distance using known object width + focal length."""
-    known_w = KNOWN_WIDTHS_M.get(label, 0.5)
-    if bbox_w_px < 1:
-        return 99.0
-    return round((known_w * FOCAL_LENGTH_PX) / bbox_w_px, 1)
+KNOWN_HEIGHTS_M = {
+    "person": 1.75, "dog": 0.5, "bicycle": 1.1, "motorcycle": 1.2,
+}
+# Vertical FOV ~= horizontal since we resize to square (224×224)
+FOCAL_LENGTH_PX_V = FOCAL_LENGTH_PX
+
+def estimate_distance(label: str, bbox_w_px: float, bbox_h_px: float = 0.0) -> float:
+    """Estimate distance from bbox dimensions. Uses height for people (more stable)."""
+    estimates = []
+    known_w = KNOWN_WIDTHS_M.get(label)
+    known_h = KNOWN_HEIGHTS_M.get(label)
+    if known_w and bbox_w_px >= 2:
+        estimates.append((known_w * FOCAL_LENGTH_PX) / bbox_w_px)
+    if known_h and bbox_h_px >= 2:
+        estimates.append((known_h * FOCAL_LENGTH_PX_V) / bbox_h_px)
+    if not estimates:
+        w = bbox_w_px or bbox_h_px
+        if w < 1:
+            return 99.0
+        estimates.append((0.5 * FOCAL_LENGTH_PX) / w)
+    dist = sum(estimates) / len(estimates)
+    return round(max(0.3, min(dist, 50.0)), 1)
 
 
 def bbox_to_direction(cx_px: float, half_fov: float = CAM_HALF_FOV_DEG) -> float:
@@ -162,7 +178,7 @@ class VisionProcessor:
                     "label": label,
                     "confidence": round(conf, 3),
                     "direction_deg": round(bbox_to_direction(cx), 1),
-                    "distance_m": estimate_distance(label, w),
+                    "distance_m": estimate_distance(label, w, y2 - y1),
                     "bbox": [round(x1), round(y1), round(x2), round(y2)],
                 })
         return detections
@@ -201,7 +217,7 @@ class VisionProcessor:
                 "label": label,
                 "confidence": round(float(conf), 3),
                 "direction_deg": round(bbox_to_direction(cx), 1),
-                "distance_m": estimate_distance(label, w),
+                "distance_m": estimate_distance(label, w, y2s - y1s),
                 "bbox": [round(x1s), round(y1s), round(x2s), round(y2s)],
             })
         return detections
@@ -431,7 +447,7 @@ class DualVisionProcessor:
                         "label": label,
                         "confidence": round(conf, 3),
                         "direction_deg": round(direction, 1),
-                        "distance_m": estimate_distance(label, x2 - x1),
+                        "distance_m": estimate_distance(label, x2 - x1, y2 - y1),
                         "bbox": [round(x1), round(y1), round(x2), round(y2)],
                         "camera": int(offset // 90),
                     })

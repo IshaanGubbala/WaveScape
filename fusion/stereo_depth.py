@@ -22,8 +22,8 @@ except ImportError:
     CV2_AVAILABLE = False
 
 # Physical constants
-BASELINE_M = 0.065          # 65mm baseline between lens centers
-CAM_HALF_FOV_DEG = 33.0     # IMX708 horizontal half-FOV
+BASELINE_M = 0.111          # 111mm baseline between lens centers
+CAM_HALF_FOV_DEG = 30.5     # 122° total coverage / 2 cameras = 61° per cam, half = 30.5°
 
 # Processing resolution — same as YOLO input, no extra resize needed
 STEREO_W = 96

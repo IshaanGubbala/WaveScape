@@ -46,6 +46,9 @@ _stereo_lock = threading.Lock()
 _perf_state: dict = {"frame_ms": 0.0, "fps": 0.0, "yolo_ms": 0.0, "stereo_ms": 0.0, "flow_ms": 0.0, "ts": 0.0}
 _perf_lock = threading.Lock()
 
+_mac_scene: dict = {"scene_objects": [], "escape_dir_deg": None, "safe_paths": [], "ts": 0.0}
+_mac_lock = threading.Lock()
+
 # Radar canvas
 _MAP_SIZE = 400
 _MAP_CX   = _MAP_SIZE // 2
@@ -132,6 +135,16 @@ def update_perf(frame_ms: float, fps: float, yolo_ms: float = 0.0, stereo_ms: fl
         _perf_state["stereo_ms"] = stereo_ms
         _perf_state["flow_ms"] = flow_ms
         _perf_state["ts"] = time.time()
+
+
+def update_mac_scene(result: dict):
+    if not result:
+        return
+    with _mac_lock:
+        _mac_scene["scene_objects"] = result.get("scene_objects", [])
+        _mac_scene["escape_dir_deg"] = result.get("escape_dir_deg")
+        _mac_scene["safe_paths"] = result.get("safe_paths", [])
+        _mac_scene["ts"] = time.time()
 
 
 def update_spatial(smap, beam_scan: list = None):

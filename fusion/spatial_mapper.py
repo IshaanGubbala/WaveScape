@@ -12,10 +12,10 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 LLAMA_URL = "http://192.168.68.65:8081"  # Mac Metal (LAN offload, ~160ms vs ~5s Pi CPU)
-SPATIAL_UPDATE_INTERVAL = 2.0  # CJK fine-tune ~1.5s/call on Pi
+SPATIAL_UPDATE_INTERVAL = 0.0  # back-to-back; naturally rate-limited by inference (~1.5s)
 GEMMA_TIMEOUT_S = 10.0          # force-release busy lock after this many seconds
 GEMMA_HTTP_TIMEOUT = 9.0        # HTTP request timeout (slightly under busy timeout)
-SCENE_UNCHANGED_TTL = 6.0       # skip Gemma if scene unchanged within this window
+SCENE_UNCHANGED_TTL = 2.0       # skip Gemma if scene unchanged within this window
 
 # Smooth-angle CJK codebook — 8 tokens total, 1° precision
 # Format: T1 O1 L1 U1 T2 O2 L2 U2  (no spaces), deg = T*19 + O
@@ -292,6 +292,8 @@ class SpatialMapper:
         self._last_audio_trigger: float = 0.0
         self._last_scene_hash: int = 0
         self._last_scene_time: float = 0.0
+        self._err_count: int = 0
+        self._last_err_time: float = 0.0
 
     @property
     def current_map(self) -> SpatialMap:
@@ -322,6 +324,11 @@ class SpatialMapper:
                 print("  [SPATIAL] busy timeout — force-releasing lock")
                 self._busy.clear()
             else:
+                return False
+        # Exponential backoff on repeated errors (cap at 60s)
+        if self._err_count > 0:
+            backoff = min(60.0, 2.0 * self._err_count)
+            if time.time() - self._last_err_time < backoff:
                 return False
         interval_due = (time.time() - self._last_call) >= SPATIAL_UPDATE_INTERVAL
         audio_triggered = self._audio_spike(beam_scan or [])
@@ -433,6 +440,11 @@ class SpatialMapper:
             self.map_cb(spatial_map, beam_scan)
 
         except Exception as e:
-            print(f"  [SPATIAL] error: {e}")
+            self._err_count += 1
+            self._last_err_time = time.time()
+            if self._err_count <= 2 or self._err_count % 60 == 0:
+                print(f"  [SPATIAL] error: {e}  (×{self._err_count})")
+        else:
+            self._err_count = 0  # reset on success
         finally:
             self._busy.clear()
