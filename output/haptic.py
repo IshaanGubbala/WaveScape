@@ -8,8 +8,11 @@ GPIO haptic motor driver using lgpio (Pi 5 native).
 (GPIO 18/19/20 reserved for I2S mic array; GPIO 12/13 for cooling fan)
 Falls back to console print on non-Pi platforms.
 """
+import logging
 import math
 import threading
+
+_log = logging.getLogger(__name__)
 
 # X-formation motor layout: (gpio_pin, angle_deg)
 MOTORS = [
@@ -73,7 +76,7 @@ class HapticController:
 
         if not GPIO_AVAILABLE:
             bar_parts = " ".join(f"{_MOTOR_LABELS[i]}={'█' * (d // 10):<10}" for i, d in enumerate(duties))
-            print(f"  [HAPTIC   ] dir={direction_deg:5.1f}° {urgency:8s} {bar_parts} pat={pattern}")
+            _log.debug("haptic: %s", pattern)
 
     def _direction_to_duties(self, direction_deg: float, max_duty: int) -> list[int]:
         """Cosine activation over 4 X-formation motors.

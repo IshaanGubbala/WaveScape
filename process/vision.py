@@ -1,3 +1,5 @@
+import logging
+_log = logging.getLogger(__name__)
 """
 Vision processing: YOLO-nano detection + optical flow motion vectors.
 Outputs detections in the format expected by sensor_encoder.
@@ -41,7 +43,7 @@ CAM_HALF_FOV_DEG = 33.0
 FOCAL_LENGTH_PX = round((224 / 2) / math.tan(math.radians(CAM_HALF_FOV_DEG)))
 KNOWN_WIDTHS_M = {
     "car": 1.8, "truck": 2.4, "bus": 2.5, "motorcycle": 0.8,
-    "bicycle": 0.6, "person": 0.5, "dog": 0.4,
+    "bicycle": 0.6, "person": 0.45, "dog": 0.35,
 }
 IMG_W = 224
 IMG_H = 224
@@ -49,10 +51,36 @@ IMG_CENTER_X = IMG_W / 2
 
 
 KNOWN_HEIGHTS_M = {
-    "person": 1.75, "dog": 0.5, "bicycle": 1.1, "motorcycle": 1.2,
+    "person": 1.40,  # 1.75m body but bbox typically captures ~80% (feet cut off)
+    "dog": 0.42, "bicycle": 1.0, "motorcycle": 1.1,
 }
 # Vertical FOV ~= horizontal since we resize to square (224×224)
 FOCAL_LENGTH_PX_V = FOCAL_LENGTH_PX
+
+def _near_field_distance(label: str, bbox_w_px: float, bbox_h_px: float) -> float | None:
+    """Override monocular geometry when a close object fills a large part of frame."""
+    w = max(0.0, float(bbox_w_px))
+    h = max(0.0, float(bbox_h_px))
+    if w < 1 or h < 1:
+        return None
+
+    width_fill = w / IMG_W
+    height_fill = h / IMG_H
+    area_fill = math.sqrt((w * h) / (IMG_W * IMG_H))
+
+    # Width is weighted because close people are often partially cropped vertically.
+    width_weight = 1.35 if label == "person" else 1.15
+    fill = max(width_fill * width_weight, height_fill, area_fill * 1.18)
+
+    if fill >= 0.78:
+        return 0.30  # ~1 ft
+    if fill >= 0.62:
+        return 0.40  # ~1.3 ft
+    if fill >= 0.48:
+        return 0.55  # ~1.8 ft
+    if fill >= 0.34:
+        return 0.85  # ~2.8 ft
+    return None
 
 def estimate_distance(label: str, bbox_w_px: float, bbox_h_px: float = 0.0) -> float:
     """Estimate distance from bbox dimensions. Uses height for people (more stable)."""
@@ -68,7 +96,10 @@ def estimate_distance(label: str, bbox_w_px: float, bbox_h_px: float = 0.0) -> f
         if w < 1:
             return 99.0
         estimates.append((0.5 * FOCAL_LENGTH_PX) / w)
-    dist = sum(estimates) / len(estimates)
+    dist = min(estimates) if label == "person" else sum(estimates) / len(estimates)
+    near = _near_field_distance(label, bbox_w_px, bbox_h_px)
+    if near is not None:
+        dist = min(dist, near)
     return round(max(0.3, min(dist, 50.0)), 1)
 
 
@@ -78,7 +109,77 @@ def bbox_to_direction(cx_px: float, half_fov: float = CAM_HALF_FOV_DEG) -> float
     return (offset * half_fov) % 360
 
 
-YOLO_SKIP_N = 3  # run YOLO every Nth frame; flow propagates bboxes in between
+YOLO_SKIP_N = 4  # run YOLO every Nth frame; flow propagates bboxes in between
+YOLO_CONFIRM_FRAMES = 6
+YOLO_MATCH_IOU = 0.35
+
+
+def _bbox_iou(a: list[int | float], b: list[int | float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter
+    return inter / denom if denom else 0.0
+
+
+class _YOLOStabilizer:
+    """Require a detection to persist across several frames before emitting it."""
+
+    def __init__(self, min_frames: int = YOLO_CONFIRM_FRAMES):
+        self.min_frames = min_frames
+        self.tracks: list[dict] = []
+
+    def update(self, detections: list[dict]) -> list[dict]:
+        detections = list(detections or [])
+        detections.sort(key=lambda d: float(d.get("confidence", 0.0)), reverse=True)
+
+        matched_prev: set[int] = set()
+        next_tracks: list[dict] = []
+
+        for det in detections:
+            box = det.get("bbox")
+            label = str(det.get("label", "")).lower()
+            if not box or len(box) != 4:
+                continue
+
+            best_idx = None
+            best_iou = 0.0
+            for idx, tr in enumerate(self.tracks):
+                if idx in matched_prev:
+                    continue
+                if tr.get("label", "").lower() != label:
+                    continue
+                iou = _bbox_iou(box, tr.get("bbox", box))
+                if iou > best_iou:
+                    best_iou = iou
+                    best_idx = idx
+
+            if best_idx is not None and best_iou >= YOLO_MATCH_IOU:
+                prev = self.tracks[best_idx]
+                matched_prev.add(best_idx)
+                count = min(self.min_frames, int(prev.get("count", 1)) + 1)
+            else:
+                count = 1
+
+            track = dict(det)
+            track["count"] = count
+            next_tracks.append(track)
+
+        self.tracks = next_tracks
+
+        confirmed = []
+        for tr in self.tracks:
+            if int(tr.get("count", 0)) >= self.min_frames:
+                stable = dict(tr)
+                stable.pop("count", None)
+                confirmed.append(stable)
+        return confirmed
+
 
 class VisionProcessor:
     """
@@ -115,6 +216,8 @@ class VisionProcessor:
         self._yolo_lock = threading.Lock()
         self._yolo_busy = False
         self._yolo_thread: threading.Thread | None = None
+        self._yolo_ms: float = 0.0  # EMA of last inference latency
+        self._yolo_stabilizer = _YOLOStabilizer()
 
     def _load_model(self):
         if not CV2_AVAILABLE:
@@ -128,7 +231,7 @@ class VisionProcessor:
                 opts = _ort.SessionOptions()
                 opts.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 opts.execution_mode = _ort.ExecutionMode.ORT_SEQUENTIAL
-                opts.intra_op_num_threads = 2  # match taskset -c 0,1
+                opts.intra_op_num_threads = 2  # MUST match taskset -c 0,1 pinning — 4 threads on 2 cores = 2.42× slower (measured)
                 opts.inter_op_num_threads = 1
                 self._ort_session = _ort.InferenceSession(
                     str(self.model_size),
@@ -142,7 +245,7 @@ class VisionProcessor:
                     if prop.key == "names":
                         self._ort_names = _ast.literal_eval(prop.value)
                         break
-                print(f"  [YOLO] ORT session: ORT_ENABLE_ALL, intra_threads=2, {len(self._ort_names)} classes")
+                _log.info("YOLO session ready")
             else:
                 self._model = YOLO(self.model_size, task="detect")
             if self.async_yolo:
@@ -150,14 +253,26 @@ class VisionProcessor:
                 self._yolo_thread.start()
 
     def _yolo_worker(self):
+        import time as _t
         while True:
             frame = self._yolo_q.get()
             if frame is None:
                 break
+            t0 = _t.perf_counter()
             dets = self._run_yolo_sync(frame)
+            ms = (_t.perf_counter() - t0) * 1000.0
             with self._yolo_lock:
                 self._yolo_result = dets
+                # Skip first inference (model warm-up spike); EMA after that
+                if self._yolo_ms == 0.0:
+                    self._yolo_ms = ms
+                else:
+                    self._yolo_ms = 0.6 * self._yolo_ms + 0.4 * ms
                 self._yolo_busy = False
+
+    def get_yolo_ms(self) -> float:
+        with self._yolo_lock:
+            return self._yolo_ms
 
     def _run_yolo_sync(self, frame: np.ndarray) -> list[dict]:
         if self._ort_session is not None:
@@ -186,8 +301,7 @@ class VisionProcessor:
     def _run_yolo_ort(self, frame: np.ndarray) -> list[dict]:
         """Direct ORT inference — no ultralytics Python overhead.
         Input: BGR frame at any size (resized internally to self.imgsz).
-        Output: [x1,y1,x2,y2,conf,class_id] in IMG_W/IMG_H coord space.
-        Model end2end=True: output already post-NMS, 189 slots, filter by conf."""
+        Supports both post-NMS [N,6] and raw YOLO [84,N] outputs."""
         # Preprocess: BGR->RGB, resize to model input, NCHW float32 [0,1]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         if rgb.shape[:2] != (self.imgsz, self.imgsz):
@@ -195,22 +309,70 @@ class VisionProcessor:
         inp = rgb.astype(np.float32) * (1.0 / 255.0)
         inp = inp.transpose(2, 0, 1)[np.newaxis]  # (1,3,H,W)
 
-        raw = self._ort_session.run(None, {"images": inp})[0][0]  # (189, 6)
+        raw = self._ort_session.run(None, {"images": inp})[0]
+        raw = np.squeeze(raw)
 
         # Scale factor from model coords (imgsz) back to display coords (IMG_W/H)
         sx = IMG_W / self.imgsz
         sy = IMG_H / self.imgsz
 
+        candidates = []
+
+        if raw.ndim == 2 and raw.shape[-1] >= 6 and raw.shape[0] != 84:
+            # End-to-end/exported NMS format: [x1,y1,x2,y2,conf,class_id].
+            for row in raw:
+                x1, y1, x2, y2, conf, cls_f = row[:6]
+                candidates.append((float(x1), float(y1), float(x2), float(y2), float(conf), int(cls_f)))
+        else:
+            # Raw YOLO format: [4 + classes, anchors]. First 4 are xywh.
+            pred = raw
+            if pred.ndim != 2:
+                return []
+            if pred.shape[0] < pred.shape[1] and pred.shape[0] >= 6:
+                pred = pred.T
+            boxes = pred[:, :4]
+            scores = pred[:, 4:]
+            cls_ids = np.argmax(scores, axis=1)
+            confs = scores[np.arange(scores.shape[0]), cls_ids]
+            for (cx, cy, w, h), conf, cls_id in zip(boxes, confs, cls_ids):
+                if float(conf) < self._conf:
+                    continue
+                x1 = float(cx - w / 2)
+                y1 = float(cy - h / 2)
+                x2 = float(cx + w / 2)
+                y2 = float(cy + h / 2)
+                candidates.append((x1, y1, x2, y2, float(conf), int(cls_id)))
+
+        def _iou(a, b) -> float:
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+            inter = iw * ih
+            area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+            area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            union = area_a + area_b - inter
+            return inter / union if union else 0.0
+
         detections = []
-        for row in raw:
-            x1, y1, x2, y2, conf, cls_f = row
+        candidates.sort(key=lambda r: r[4], reverse=True)
+        kept: list[tuple[float, float, float, float, float, int]] = []
+        for cand in candidates:
+            x1, y1, x2, y2, conf, cls_id = cand
             if conf < self._conf:
                 continue
-            label = self._ort_names.get(int(cls_f), "unknown")
+            label = self._ort_names.get(cls_id, self._ort_names.get(str(cls_id), "unknown"))
             if label not in THREAT_CLASSES:
                 continue
+            box = (x1, y1, x2, y2)
+            if any(k[5] == cls_id and _iou(box, k[:4]) > 0.45 for k in kept):
+                continue
+            kept.append(cand)
             x1s, y1s = x1 * sx, y1 * sy
             x2s, y2s = x2 * sx, y2 * sy
+            x1s, y1s = max(0, x1s), max(0, y1s)
+            x2s, y2s = min(IMG_W - 1, x2s), min(IMG_H - 1, y2s)
             cx = (x1s + x2s) / 2
             w = x2s - x1s
             detections.append({
@@ -220,6 +382,8 @@ class VisionProcessor:
                 "distance_m": estimate_distance(label, w, y2s - y1s),
                 "bbox": [round(x1s), round(y1s), round(x2s), round(y2s)],
             })
+            if len(detections) >= 12:
+                break
         return detections
 
     def _propagate(self, dets: list[dict], flow: np.ndarray) -> list[dict]:
@@ -274,7 +438,7 @@ class VisionProcessor:
         if self._prev_gray is not None:
             dense_flow = cv2.calcOpticalFlowFarneback(
                 self._prev_gray, gray, None,
-                pyr_scale=0.5, levels=1, winsize=11,
+                pyr_scale=0.5, levels=1, winsize=9,  # winsize 9 vs 11: 0% diff on Pi 5 (measured)
                 iterations=2, poly_n=5, poly_sigma=1.1, flags=0,
             )
         self._prev_gray = gray
@@ -295,6 +459,8 @@ class VisionProcessor:
                 detections = self._propagate(detections, dense_flow)
         else:
             detections = self._run_yolo_sync(frame)
+
+        detections = self._yolo_stabilizer.update(detections)
 
         # Build flow_vectors from dense flow over detection bboxes
         flow_vectors = []
@@ -334,8 +500,8 @@ class VisionProcessor:
             try:
                 self._yolo_q.put(None, timeout=2)
                 self._yolo_thread.join(timeout=5)
-            except Exception:
-                pass
+            except Exception as _e:
+                _log.debug('cleanup error: %s', _e)
         if self._picam:
             self._picam.stop()
         if self._cap:
@@ -403,7 +569,8 @@ class DualVisionProcessor:
 
         self._picam0: object | None = None
         self._picam1: object | None = None
-        self._cam1_available = False
+        self._cam0_available: bool | None = None
+        self._cam1_available: bool | None = None
         self._conf = 0.10 if str(model_size).endswith(".onnx") else 0.15
 
         self._prev_gray0 = None
@@ -461,15 +628,21 @@ class DualVisionProcessor:
     def _open_cameras(self):
         if not PICAMERA2_AVAILABLE:
             return
-        if self._picam0 is None:
-            self._picam0 = Picamera2(0)
-            cfg = self._picam0.create_preview_configuration(
-                main={"size": (IMG_W, IMG_H), "format": "RGB888"}
-            )
-            self._picam0.configure(cfg)
-            self._picam0.start()
+        if self._picam0 is None and self._cam0_available is not False:
+            try:
+                self._picam0 = Picamera2(0)
+                cfg = self._picam0.create_preview_configuration(
+                    main={"size": (IMG_W, IMG_H), "format": "RGB888"}
+                )
+                self._picam0.configure(cfg)
+                self._picam0.start()
+                self._cam0_available = True
+            except Exception as exc:
+                self._picam0 = None
+                self._cam0_available = False
+                _log.warning("DualVision: Camera 0 unavailable (%s); using blank frames", exc)
 
-        if self._picam1 is None and not self._cam1_available:
+        if self._picam1 is None and self._cam1_available is not False:
             try:
                 self._picam1 = Picamera2(1)
                 cfg = self._picam1.create_preview_configuration(
@@ -478,10 +651,11 @@ class DualVisionProcessor:
                 self._picam1.configure(cfg)
                 self._picam1.start()
                 self._cam1_available = True
-                print("[DualVision] Camera 1 online — 360° coverage active")
-            except Exception:
+                _log.info("DualVision: Camera 1 online")
+            except Exception as exc:
                 self._picam1 = None
                 self._cam1_available = False
+                _log.warning("DualVision: Camera 1 unavailable (%s); continuing single-camera", exc)
 
     def _capture(self, picam) -> np.ndarray:
         rgb = picam.capture_array()
@@ -496,7 +670,7 @@ class DualVisionProcessor:
         if prev_gray is not None:
             dense_flow = cv2.calcOpticalFlowFarneback(
                 prev_gray, gray, None,
-                pyr_scale=0.5, levels=1, winsize=11,
+                pyr_scale=0.5, levels=1, winsize=9,
                 iterations=2, poly_n=5, poly_sigma=1.1, flags=0,
             )
 
@@ -591,8 +765,8 @@ class DualVisionProcessor:
             try:
                 self._yolo_q.put(None, timeout=2)
                 self._thread.join(timeout=5)
-            except Exception:
-                pass
+            except Exception as _e:
+                _log.debug('cleanup error: %s', _e)
         for cam in (self._picam0, self._picam1):
             if cam:
                 try:

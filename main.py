@@ -9,6 +9,9 @@ import threading
 import argparse
 import sys
 import os
+import logging
+
+_log = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -81,13 +84,9 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
     _default_model = "/Users/ishaangubbala/Documents/airesearch/yolov8n.pt" if platform.system() == "Darwin" else "yolo26n.pt"
     _yolo = yolo_model or _default_model
 
-    print("=" * 60)
-    print("THREATDETECT — starting pipeline")
-    print(f"  server: {LLAMA_URL}")
-    print(f"  mode:   {'MOCK' if mock else 'REAL HARDWARE'}")
+    _log.info("THREATDETECT — starting pipeline  server=%s  mode=%s", LLAMA_URL, "MOCK" if mock else "REAL HARDWARE")
     if not mock:
-        print(f"  yolo:   {_yolo}")
-    print("=" * 60)
+        _log.info("yolo: %s", _yolo)
 
     # Components
     _imgsz = 96 if str(_yolo).endswith(".onnx") else 160
@@ -97,26 +96,24 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
         vision = DualVisionProcessor(model_size=_yolo, imgsz=_imgsz)
     else:
         vision = VisionProcessor(model_size=_yolo, imgsz=_imgsz, async_yolo=True)
-    # Try MCP3008 SPI ADC first (Pi 5 + MAX4466 mic array), fall back to
-    # sounddevice (Mac built-in mic / I2S), then mock.
+    # Try MCP3008 SPI ADC first (Pi 5 + MAX4466 mic array), fall back to mock.
+    # In mock mode skip real hardware entirely — AudioProcessor lacks acoustic_analyze.
     audio = None
-    try:
-        from process.audio_mcp3008 import MCP3008AudioProcessor
-        audio = MCP3008AudioProcessor(num_mics=4, sample_rate=10000)
-        import time as _t; _t.sleep(0.3)  # warm ring buffer
-        probe = audio.capture_window(duration_ms=50)
-        if probe is None or probe.size == 0:
-            raise RuntimeError("no MCP3008 samples")
-        print(f"  audio:  MCP3008 SPI (4ch @ 10000Hz)")
-    except Exception as e:
-        print(f"  audio:  MCP3008 unavailable ({e}), trying sounddevice...")
+    if not mock:
         try:
-            audio = AudioProcessor()
-            audio.capture_window(duration_ms=50)
-            print(f"  audio:  real (sounddevice, {audio._channels}ch @ {audio._rate}Hz)")
-        except Exception:
+            from process.audio_mcp3008 import MCP3008AudioProcessor
+            audio = MCP3008AudioProcessor(num_mics=4, sample_rate=10000)
+            import time as _t; _t.sleep(0.3)  # warm ring buffer
+            probe = audio.capture_window(duration_ms=50)
+            if probe is None or probe.size == 0:
+                raise RuntimeError("no MCP3008 samples")
+            _log.info("audio: MCP3008 SPI 4ch @ 10000Hz")
+        except Exception as e:
+            _log.warning("audio: MCP3008 unavailable (%s), falling back to mock", e)
             audio = MockAudioProcessor()
-            print("  audio:  mock (no input device)")
+    if audio is None:
+        audio = MockAudioProcessor()
+        _log.info("audio: mock")
     memory = ThreatMemory()
     router = CascadeRouter(memory)
     tracker = ObjectTracker()
@@ -131,7 +128,7 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
         if direction is not None and urgency in ("medium", "high", "critical"):
             haptic_fire(direction, urgency, 0.85, "SPATIAL")
         if smap.summary:
-            print(f"    ↳ {smap.summary}")
+            _log.debug("scene: %s", smap.summary)
 
     spatial_mapper = SpatialMapper(on_spatial_map, server_url=LLAMA_URL)
     mac_offload = MacSceneOffload()
@@ -157,14 +154,14 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
         _vid_fps = _video_cap.get(_cv2.CAP_PROP_FPS)
         if 1 <= _vid_fps <= 120:
             _loop_fps = _vid_fps if 1 <= _vid_fps <= 120 else TARGET_FPS
-            print(f"  video: {video_path}  (native {_loop_fps:.1f}fps)")
+            _log.info("video: %s (%.1ffps)", video_path, _loop_fps)
         else:
             _loop_fps = TARGET_FPS
-            print(f"  video: {video_path}")
+            _log.info("video: %s", video_path)
     else:
         _loop_fps = TARGET_FPS
 
-    print(f"\nRunning at {_loop_fps:.1f}fps sensor loop. Ctrl+C to stop.\n")
+    _log.info("running at %.1ffps, Ctrl+C to stop", _loop_fps)
     frame_count = 0
     interval = 1.0 / _loop_fps
     _next_frame_time = time.monotonic()
@@ -219,20 +216,23 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                 snap = SensorSnapshot(detections=detections, audio_labels=[], heading_deg=0.0, pitch_deg=0.0, flow_vectors=flow)
                 tier = router.route(snap)
                 p_threat = anticipator.predict(snap)
-                audio_window = audio.capture_window(duration_ms=50)
+                audio_window = audio.capture_window(duration_ms=200)
+                acoustic_sources_vid = audio.acoustic_analyze(audio_window)
                 beam_scan = audio.beamform_scan(audio_window)
                 audio_labels_vid = audio.classify(audio_window) if frame_count % 5 == 0 else []
-                if beam_scan and audio_labels_vid:
-                    beam_scan[0]["label"] = audio_labels_vid[0][0]
                 web_ui.log_audio_event(audio_labels_vid, beam_scan)
-                if beam_scan and beam_scan[0]["energy"] > 0.03:
+                if acoustic_sources_vid:
+                    top_src = acoustic_sources_vid[0]
+                    if top_src.energy > 0.03 and _should_haptic("AUDIO", top_src.azimuth_deg):
+                        haptic_fire(top_src.azimuth_deg, "medium", top_src.energy, "AUDIO")
+                elif beam_scan and beam_scan[0]["energy"] > 0.03:
                     top = beam_scan[0]
                     if _should_haptic("AUDIO", top["direction_deg"]):
                         haptic_fire(top["direction_deg"], "medium", top["energy"], "AUDIO")
                 if frame_count % 10 == 0:
                     det_str = " ".join(f"{d['label']}@{d['confidence']:.2f}" for d in detections) or "nothing"
                     beam_str = ", ".join(f"{b['direction_deg']}°={b['energy']:.3f}" for b in beam_scan[:3]) or "quiet"
-                    print(f"  [frame {frame_count:4d}] tier={tier} dets=[{det_str}] mic=[{beam_str}]")
+                    _log.debug("frame %d tier=%s", frame_count, tier)
                 if tier >= 1 and detections:
                     d = max(detections, key=lambda x: x["confidence"])
                     if _should_haptic("TIER1", d["direction_deg"]):
@@ -251,19 +251,20 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                             f"{'.' if s['safe'] else 'X'}{s['angle_deg']:.0f}°={s['min_depth_m']:.1f}m"
                             for s in sdepth["sector_depths"]
                         )
-                        print(f"    [stereo-sim] escape={sdepth['escape_dir_deg']:.0f}° "
-                              f"min={sdepth['min_depth_m']:.2f}m {sdepth['latency_ms']:.0f}ms | {sectors}")
+                        _log.debug("stereo-sim escape")
                 _frame_ms = (time.monotonic() - _t_frame_start) * 1000
                 _frame_times.append(_frame_ms)
                 _fps = 1000.0 / (sum(_frame_times) / len(_frame_times)) if _frame_times else 0.0
-                web_ui.update_perf(_frame_ms, _fps, yolo_ms=0.0, stereo_ms=_last_stereo_ms)
-                mac_offload.update([], detections, beam_scan)
+                web_ui.update_perf(_frame_ms, _fps, yolo_ms=vision.get_yolo_ms() if hasattr(vision, "get_yolo_ms") else 0.0, stereo_ms=_last_stereo_ms)
+                if not (stereo_sim and stereo is not None and frame_count % 2 == 0):
+                    mac_offload.update([], detections, beam_scan)
                 if mac_offload.is_fresh():
                     web_ui.update_mac_scene(mac_offload.get_result())
                 if spatial_mapper.should_update(beam_scan):
-                    print(f"\n  [frame {frame_count:4d}] SPATIAL → Gemma")
+                    _log.debug("frame %4d SPATIAL → Gemma", frame_count)
                     spatial_mapper.update(detections, beam_scan, frame=frame, heading_deg=0.0,
-                                  audio_b64=audio.capture_wav_b64(duration_ms=2000))
+                                  audio_b64=audio.capture_wav_b64(duration_ms=2000),
+                                  acoustic_sources=acoustic_sources_vid)
                 continue
 
             # Capture
@@ -291,8 +292,7 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                                 f"{'.' if s['safe'] else 'X'}{s['angle_deg']:.0f}°={s['min_depth_m']:.1f}m"
                                 for s in sdepth["sector_depths"]
                             )
-                            print(f"    [stereo] escape={sdepth['escape_dir_deg']:.0f}° "
-                                  f"min={sdepth['min_depth_m']:.2f}m {sdepth['latency_ms']:.0f}ms | {sectors}")
+                            _log.debug("stereo escape")
             else:
                 frame = vision.read_frame()
                 if frame is None:
@@ -300,13 +300,16 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
                     continue
                 detections, flow = vision.process_frame(frame)
                 web_ui.update_frame(0, frame, detections)
-            audio_window = audio.capture_window(duration_ms=50)
+            audio_window = audio.capture_window(duration_ms=200)
+            acoustic_sources = audio.acoustic_analyze(audio_window)
             beam_scan = audio.beamform_scan(audio_window)
             audio_labels = audio.classify(audio_window) if frame_count % 5 == 0 else []
-            if beam_scan and audio_labels:
-                beam_scan[0]["label"] = audio_labels[0][0]
             web_ui.log_audio_event(audio_labels, beam_scan)
-            if beam_scan and beam_scan[0]["energy"] > 0.08:
+            if acoustic_sources:
+                top_src = acoustic_sources[0]
+                if top_src.energy > 0.08 and _should_haptic("AUDIO", top_src.azimuth_deg):
+                    haptic_fire(top_src.azimuth_deg, "medium", top_src.energy, "AUDIO")
+            elif beam_scan and beam_scan[0]["energy"] > 0.08:
                 top = beam_scan[0]
                 haptic_fire(top["direction_deg"], "medium", top["energy"], "AUDIO")
 
@@ -331,7 +334,7 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
             if frame_count % 10 == 0:
                 det_str = " ".join(f"{d['label']}@{d['confidence']:.2f}" for d in detections) or "nothing"
                 beam_str = ", ".join(f"{b['direction_deg']}°={b['energy']:.3f}" for b in beam_scan[:3]) or "quiet"
-                print(f"  [frame {frame_count:4d}] tier={tier} dets=[{det_str}] mic=[{beam_str}]")
+                _log.debug("frame %d tier=%s", frame_count, tier)
 
             # Tier 1: direct haptic from high-confidence YOLO detection
             if tier >= 1 and detections:
@@ -342,11 +345,12 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
             if stereo is None and frame_count % 20 == 0:
                 mac_offload.update([], detections, beam_scan)
 
-            # Spatial mapper: periodic Gemma call (every 3s) with frame + real mic beams
+            # Spatial mapper: periodic Gemma call (every 3s) with frame + acoustic localizer
             if spatial_mapper.should_update(beam_scan):
-                print(f"\n  [frame {frame_count:4d}] SPATIAL → Gemma")
+                _log.debug("frame %4d SPATIAL → Gemma", frame_count)
                 spatial_mapper.update(detections, beam_scan, frame=frame, heading_deg=0.0,
-                                  audio_b64=audio.capture_wav_b64(duration_ms=2000))
+                                  audio_b64=audio.capture_wav_b64(duration_ms=2000),
+                                  acoustic_sources=acoustic_sources)
 
             # Predictor: 10Hz haptic extrapolation between Gemma calls
             if flow:
@@ -364,15 +368,13 @@ def main(mock: bool = True, dual_cam: bool = False, yolo_model: str = None, vide
             _frame_ms = (time.monotonic() - t0) * 1000
             _frame_times.append(_frame_ms)
             _fps = 1000.0 / (sum(_frame_times) / len(_frame_times)) if _frame_times else 0.0
-            web_ui.update_perf(_frame_ms, _fps, stereo_ms=_last_stereo_ms)
+            web_ui.update_perf(_frame_ms, _fps, yolo_ms=vision.get_yolo_ms() if hasattr(vision, "get_yolo_ms") else 0.0, stereo_ms=_last_stereo_ms)
 
     except KeyboardInterrupt:
         predictor.stop()
         _haptic.cleanup()
         stats = router.stats()
-        print(f"\n{'='*60}")
-        print(f"Stopped after {frame_count} frames")
-        print(f"Gemma calls: {stats['gemma_calls']} ({stats['gemma_calls']/max(frame_count,1)*100:.1f}% of frames)")
+        _log.info("stopped after %d frames, gemma calls: %d", frame_count, stats["gemma_calls"])
         vision.release()
 
 
@@ -395,6 +397,6 @@ if __name__ == "__main__":
         import threading
         t = threading.Thread(target=web_ui.launch, kwargs={"server_name": "0.0.0.0", "server_port": 7860}, daemon=True)
         t.start()
-        print("  web UI: http://0.0.0.0:7860")
+        _log.info("web UI: http://0.0.0.0:7860")
 
     main(mock=not args.real, dual_cam=args.dual_cam, yolo_model=args.yolo_model, video_path=args.video, stereo_sim=args.stereo_sim)

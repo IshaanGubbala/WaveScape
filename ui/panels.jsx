@@ -10,8 +10,10 @@ function CameraFeed({ threats, yoloDets, fps, yoloMs, temp, heading, liveCam, on
   const animRef   = useRef(0);
   const detsRef   = useRef(yoloDets || []);
   const liveRef   = useRef(liveConnected);
+  const headingRef = useRef(heading);
   useEffect(()=>{ detsRef.current = yoloDets || []; }, [yoloDets]);
   useEffect(()=>{ liveRef.current = liveConnected; }, [liveConnected]);
+  useEffect(()=>{ headingRef.current = heading; }, [heading]);
   const _feedHost = window.location.hostname || "raspberrypi.local";
   const _mjpegUrl = `http://${_feedHost}:8090/video_feed`;
 
@@ -28,12 +30,12 @@ function CameraFeed({ threats, yoloDets, fps, yoloMs, temp, heading, liveCam, on
 
       const dets = detsRef.current;
       const isLive = liveRef.current;
+      const hdg = headingRef.current;
 
       if(!isLive){
-        // Offline state: dark background + centered text
-        ctx.fillStyle="#0a0e0d"; ctx.fillRect(0,0,W,H);
-        ctx.fillStyle="rgba(32,201,151,0.35)";
-        ctx.font="11px 'IBM Plex Mono',monospace";
+        ctx.fillStyle="#f7fafc"; ctx.fillRect(0,0,W,H);
+        ctx.fillStyle="rgba(15,157,138,0.42)";
+        ctx.font="11px Inter, system-ui, sans-serif";
         ctx.textAlign="center"; ctx.textBaseline="middle";
         ctx.fillText("NO FEED — PIPELINE OFFLINE",W/2,H/2);
         ctx.textAlign="left"; ctx.textBaseline="alphabetic";
@@ -41,43 +43,220 @@ function CameraFeed({ threats, yoloDets, fps, yoloMs, temp, heading, liveCam, on
         return;
       }
 
-      // Draw exact YOLO bboxes mapped from normalized coords to canvas size
+      // ── YOLO bboxes ──
       const URGENCY_COL = {critical:"#E24B4A", high:"#F59E0B", medium:"#20C997", low:"rgba(32,201,151,0.5)"};
-      ctx.font = "bold 10px 'IBM Plex Mono',monospace";
+      ctx.font = "bold 10px JetBrains Mono, monospace";
 
       dets.forEach(d=>{
         const [x1n,y1n,x2n,y2n] = d.bbox_n;
         const bx=x1n*W, by=y1n*H, bw=(x2n-x1n)*W, bh=(y2n-y1n)*H;
         const col = URGENCY_COL[d.urgency] || "#20C997";
         const brk = Math.min(16, Math.max(6, bw*0.22));
-
-        // Corner brackets
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 1.8;
+        ctx.strokeStyle = col; ctx.lineWidth = 1.8;
         [[bx,by,1,1],[bx+bw,by,-1,1],[bx,by+bh,1,-1],[bx+bw,by+bh,-1,-1]].forEach(([x,y,sx,sy])=>{
           ctx.beginPath();
           ctx.moveTo(x+brk*sx,y); ctx.lineTo(x,y); ctx.lineTo(x,y+brk*sy);
           ctx.stroke();
         });
-
-        // Label pill (top-left of box)
         const lbl = `${d.label}  ${Math.round(d.conf*100)}%`;
         const tw = ctx.measureText(lbl).width;
-        ctx.fillStyle="rgba(0,0,0,0.72)";
-        ctx.fillRect(bx, by-15, tw+10, 14);
-        ctx.fillStyle=col;
-        ctx.fillText(lbl, bx+5, by-4);
-
-        // Distance tag (bottom-right)
+        ctx.fillStyle="rgba(255,255,255,0.84)"; ctx.fillRect(bx, by-15, tw+10, 14);
+        ctx.fillStyle=col; ctx.fillText(lbl, bx+5, by-4);
         if(d.dist > 0){
           const dt = `${d.dist}m`;
           const dw = ctx.measureText(dt).width;
-          ctx.fillStyle="rgba(0,0,0,0.72)";
-          ctx.fillRect(bx+bw-dw-8, by+bh+1, dw+8, 13);
-          ctx.fillStyle=col;
-          ctx.fillText(dt, bx+bw-dw-3, by+bh+11);
+          ctx.fillStyle="rgba(255,255,255,0.84)"; ctx.fillRect(bx+bw-dw-8, by+bh+1, dw+8, 13);
+          ctx.fillStyle=col; ctx.fillText(dt, bx+bw-dw-3, by+bh+11);
         }
       });
+
+      // ── Navigation overlay (heading from Mac planner) ──
+      const hasNav = Math.abs(hdg) > 1;
+      if(hasNav){
+        const now = performance.now();
+        // heading: 0=forward(up), 90=right, -90 or 270=left, 180=back
+        // Normalize to -180..180 relative to forward
+        const relHdg = ((hdg + 180) % 360) - 180;
+
+        // ── Top compass strip ──
+        const stripH = 28;
+        const stripGrad = ctx.createLinearGradient(0, 0, 0, stripH);
+        stripGrad.addColorStop(0,   "rgba(7,16,22,0.42)");
+        stripGrad.addColorStop(1,   "rgba(7,16,22,0)");
+        ctx.fillStyle = stripGrad; ctx.fillRect(0, 0, W, stripH);
+
+        // Cardinal marks on strip
+        const cardinals = [
+          ["N", 0], ["NE", 45], ["E", 90], ["SE", 135],
+          ["S", 180], ["SW", 225], ["W", 270], ["NW", 315],
+        ];
+        const stripScale = W / 180; // how many px per degree in view
+        const cx2 = W / 2;
+        ctx.font = "600 9px Inter, system-ui, sans-serif";
+        ctx.textAlign = "center"; ctx.textBaseline = "top";
+        cardinals.forEach(([label, deg])=>{
+          // position relative to heading (forward at center); hdg already 0-360 from server
+          let offset = deg - hdg;
+          if(offset > 180)  offset -= 360;
+          if(offset < -180) offset += 360;
+          const x = cx2 + offset * stripScale;
+          if(x < -10 || x > W+10) return;
+          const isMajor = label.length === 1;
+          ctx.fillStyle = isMajor ? "rgba(15,157,138,0.92)" : "rgba(15,157,138,0.42)";
+          ctx.fillText(label, x, 5);
+          // tick mark
+          ctx.strokeStyle = isMajor ? "rgba(15,157,138,0.55)" : "rgba(15,157,138,0.22)";
+          ctx.lineWidth = isMajor ? 1.5 : 0.8;
+          ctx.beginPath(); ctx.moveTo(x, 16); ctx.lineTo(x, 22); ctx.stroke();
+        });
+
+        // Center heading marker (inverted triangle)
+        ctx.fillStyle = "#0f9d8a";
+        ctx.beginPath();
+        ctx.moveTo(cx2, 16); ctx.lineTo(cx2-5, 6); ctx.lineTo(cx2+5, 6); ctx.closePath(); ctx.fill();
+
+        // Heading label
+        const hdgLabel = Math.round(((hdg%360)+360)%360).toString().padStart(3,"0")+"°";
+        ctx.font = "700 10px JetBrains Mono, monospace";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        const tw2 = ctx.measureText(hdgLabel).width;
+        ctx.fillStyle = "rgba(255,255,255,0.72)";
+        ctx.beginPath();
+        if(ctx.roundRect) ctx.roundRect(cx2-tw2/2-6, 18, tw2+12, 16, 3);
+        else ctx.rect(cx2-tw2/2-6, 18, tw2+12, 16);
+        ctx.fill();
+        ctx.fillStyle = "#1f2937";
+        ctx.fillText(hdgLabel, cx2, 26);
+
+        // ── AR ground path — drawn as filled trapezoid with left+right edges ──
+        // Path starts BELOW screen so it enters the frame already wide.
+        // Edges fan out toward camera, converge to vanishing point at horizon.
+        const botY   = H * 0.92;
+        const sinR   = Math.sin(relHdg * Math.PI / 180);
+        const horizY = H * 0.55;  // vanishing point — path ends above midpoint
+        const z0     = 0.3;       // near clip — below screen, enters frame wide
+
+        // Gradient vignette
+        const botGrad = ctx.createLinearGradient(0, H*0.55, 0, H);
+        botGrad.addColorStop(0, "rgba(0,0,0,0)");
+        botGrad.addColorStop(1, "rgba(31,41,55,0.60)");
+        ctx.fillStyle = botGrad; ctx.fillRect(0, H*0.55, W, H*0.45);
+
+        // Project world point {lat, dep} → screen {x, y, hw}
+        // hw = screen half-width of path at this depth (0.4m world half-width)
+        const HALF_W_M = 0.38;
+        const LAT_SCALE = W * 0.55;
+        function proj(pt) {
+          const z  = Math.max(0.01, pt.dep);
+          const sc = z0 / z;
+          const y  = H - (H - horizY) * (1 - sc);
+          return { x: W/2 + pt.lat * LAT_SCALE * sc, y, sc,
+                   hw: HALF_W_M * LAT_SCALE * sc };
+        }
+
+        // Centerline waypoints — below-screen start so path is already wide at frame edge
+        const worldPts = [
+          { lat: 0,             dep: 0.3  },   // below screen
+          { lat: -sinR * 0.40,  dep: 0.8  },   // near — counter-lean
+          { lat:  sinR * 1.20,  dep: 2.5  },   // mid — main dodge
+          { lat:  sinR * 2.60,  dep: 6.0  },   // far — locked heading
+        ];
+        const ns = worldPts.map(proj);
+
+        // Deflect waypoints around YOLO bboxes — path must not pass through obstacles.
+        // bbox_n coords are relative to the 224px YOLO frame; canvas may differ in size.
+        // We treat the canvas W×H as the mapping target directly.
+        {
+          const dets = detsRef.current || [];
+          const MARGIN = 1.4; // path half-width multiplier for clearance
+          for (let i = 1; i < ns.length; i++) {
+            const pt = ns[i];
+            for (const det of dets) {
+              const bb = det.bbox_n; if (!bb || bb.length < 4) continue;
+              const bx1=bb[0]*W, by1=bb[1]*H, bx2=bb[2]*W, by2=bb[3]*H;
+              const margin = (pt.hw || 10) * MARGIN;
+              if (pt.y < by1 || pt.y > by2 + margin) continue; // wrong Y band
+              if (pt.x + margin < bx1 || pt.x - margin > bx2) continue; // no X overlap
+              // Blocked — push to whichever side has more room
+              const goLeft  = bx1 - margin;
+              const goRight = bx2 + margin;
+              const spaceL  = goLeft;
+              const spaceR  = W - goRight;
+              pt.x = spaceL > spaceR ? goLeft : goRight;
+            }
+          }
+        }
+
+        // Build left + right edge points (perpendicular to centerline at each point)
+        function perp(pts, i) {
+          const a = pts[Math.max(0, i-1)], b = pts[Math.min(pts.length-1, i+1)];
+          const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+          return { px: -dy/len, py: dx/len };
+        }
+        const left  = ns.map((p,i) => { const {px,py}=perp(ns,i); return {x:p.x+px*p.hw, y:p.y+py*p.hw}; });
+        const right = ns.map((p,i) => { const {px,py}=perp(ns,i); return {x:p.x-px*p.hw, y:p.y-py*p.hw}; });
+
+        // ① Filled lane — polygon of left edges then right edges reversed
+        ctx.beginPath();
+        ctx.moveTo(left[0].x, left[0].y);
+        for(let i=1;i<left.length;i++) ctx.lineTo(left[i].x, left[i].y);
+        for(let i=right.length-1;i>=0;i--) ctx.lineTo(right[i].x, right[i].y);
+        ctx.closePath();
+        const laneGrad = ctx.createLinearGradient(0, ns[ns.length-1].y, 0, H);
+        laneGrad.addColorStop(0, "rgba(15,157,138,0.06)");
+        laneGrad.addColorStop(1, "rgba(15,157,138,0.18)");
+        ctx.fillStyle = laneGrad; ctx.fill();
+
+        // ② Edge lines (left + right) — teal, fading toward horizon
+        [left, right].forEach(edge => {
+          ctx.beginPath(); ctx.moveTo(edge[0].x, edge[0].y);
+          for(let i=1;i<edge.length;i++) ctx.lineTo(edge[i].x, edge[i].y);
+          ctx.strokeStyle = "rgba(15,157,138,0.55)";
+          ctx.lineWidth = 1.5; ctx.setLineDash([5,5]);
+          ctx.lineDashOffset = -((now/60)%10);
+          ctx.stroke();
+        });
+        ctx.setLineDash([]); ctx.lineDashOffset = 0;
+
+        // ③ Dashed centerline — perspective-scaled per segment
+        for(let i=0;i<ns.length-1;i++) {
+          const a=ns[i], b=ns[i+1], avgSc=(a.sc+b.sc)/2;
+          const lw=Math.min(5,Math.max(1.5,avgSc*6));
+          const dash=Math.max(4,avgSc*20), gap=Math.max(3,avgSc*14);
+          ctx.strokeStyle="rgba(15,157,138,0.95)"; ctx.lineWidth=lw; ctx.lineCap="round";
+          ctx.setLineDash([dash,gap]);
+          ctx.lineDashOffset=-((now/32)%(dash+gap));
+          ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+        }
+        ctx.setLineDash([]); ctx.lineDashOffset=0;
+
+        // ④ Arrowhead at far end
+        const tip=ns[ns.length-1], tipPrv=ns[ns.length-2];
+        const tipA=Math.atan2(tip.y-tipPrv.y, tip.x-tipPrv.x);
+        const ah=Math.max(7,tip.sc*16), ahA=0.44;
+        ctx.fillStyle="#0f9d8a"; ctx.strokeStyle="rgba(255,255,255,0.5)"; ctx.lineWidth=1.5;
+        ctx.beginPath();
+        ctx.moveTo(tip.x,tip.y);
+        ctx.lineTo(tip.x-Math.cos(tipA-ahA)*ah, tip.y-Math.sin(tipA-ahA)*ah);
+        ctx.lineTo(tip.x-Math.cos(tipA)*ah*0.38, tip.y-Math.sin(tipA)*ah*0.38);
+        ctx.lineTo(tip.x-Math.cos(tipA+ahA)*ah, tip.y-Math.sin(tipA+ahA)*ah);
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+
+        // Turn direction label at bottom
+        const turnLabel = Math.abs(relHdg) < 15 ? "GO STRAIGHT"
+          : relHdg > 0 ? `BEAR RIGHT ${Math.round(relHdg)}°`
+          : `BEAR LEFT ${Math.round(-relHdg)}°`;
+        ctx.font = "700 11px Inter, system-ui, sans-serif";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        const tlw = ctx.measureText(turnLabel).width;
+        ctx.fillStyle = "rgba(255,255,255,0.78)";
+        ctx.beginPath();
+        if(ctx.roundRect) ctx.roundRect(cx2-tlw/2-10, botY-11, tlw+20, 22, 5);
+        else ctx.rect(cx2-tlw/2-10, botY-11, tlw+20, 22);
+        ctx.fill();
+        ctx.fillStyle = "#1f2937";
+        ctx.fillText(turnLabel, cx2, botY);
+      }
 
       animRef.current = requestAnimationFrame(tick);
     }
@@ -88,9 +267,9 @@ function CameraFeed({ threats, yoloDets, fps, yoloMs, temp, heading, liveCam, on
   const latClass = yoloMs<100?"ok":yoloMs<200?"warn":"err";
 
   return (
-    <div className="cell tactical">
+    <div className="cell">
       <div className="panel-hd">
-        <div className="ttl"><span className="tag">▸</span>CAMERA / YOLO v8-N</div>
+        <div className="ttl"><span className="tag">▸</span>Camera · YOLO v8-N</div>
         <div className="meta">
           <span>·</span>
           <button
@@ -105,33 +284,36 @@ function CameraFeed({ threats, yoloDets, fps, yoloMs, temp, heading, liveCam, on
             {liveCam ? "● OP-CAM" : "○ OP-CAM"}
           </button>
           <span>·</span>
-          <span className={liveConnected?"live":""} style={{color:liveConnected?"var(--ac)":"var(--tx-3)"}}>
+          <span className={liveConnected?"live":""} style={{color:liveConnected?"var(--teal)":"var(--tx-3)"}}>
             {liveConnected?"● LIVE":"○ OFFLINE"}
           </span>
         </div>
       </div>
       {/* Video container: MJPEG behind exact-bbox canvas overlay */}
       <div className="cam" style={{margin:"10px", position:"relative"}}>
-        <div style={{position:"relative",width:"100%",aspectRatio:"16/10",background:"#000",overflow:"hidden",borderRadius:3}}>
+        <div style={{position:"relative",width:"100%",aspectRatio:"1/1",background:"#071016",overflow:"hidden",borderRadius:14}}>
           {liveConnected && (
             <img src={_mjpegUrl} style={{
               position:"absolute",inset:0,width:"100%",height:"100%",
-              objectFit:"fill", zIndex:0,
+              objectFit:"cover",
+              zIndex:1,
+              opacity:1,
+              filter:"contrast(1.18) saturate(1.15) brightness(0.96)",
             }} alt="" />
           )}
           <canvas ref={canvasRef} style={{
-            position:"absolute",inset:0,width:"100%",height:"100%",zIndex:1,
+            position:"absolute",inset:0,width:"100%",height:"100%",zIndex:2,
           }} />
           {/* HUD overlay */}
-          <div style={{position:"absolute",top:6,left:8,display:"flex",gap:8,zIndex:2,fontFamily:"var(--mono)",fontSize:9,color:"var(--ac)"}}>
+          <div style={{position:"absolute",top:6,left:8,display:"flex",gap:8,zIndex:3,fontFamily:"var(--mono)",fontSize:9,color:"var(--teal)",background:"rgba(7,16,22,0.46)",padding:"3px 6px",borderRadius:6}}>
             <span>{fps}fps</span>
-            <span style={{color:"#444"}}>|</span>
+            <span style={{color:"var(--div-hi)"}}>|</span>
             <span className={"lat "+latClass}>{yoloMs}ms</span>
-            <span style={{color:"#444"}}>|</span>
+            <span style={{color:"var(--div-hi)"}}>|</span>
             <span>{temp}°C</span>
           </div>
-          <div style={{position:"absolute",top:6,right:8,zIndex:2,fontFamily:"var(--mono)",fontSize:9,color:"var(--red)",animation:"blink 1.2s infinite"}}>● REC</div>
-          <div style={{position:"absolute",bottom:5,left:0,right:0,display:"flex",justifyContent:"space-between",padding:"0 8px",zIndex:2,fontFamily:"var(--mono)",fontSize:8,color:"rgba(255,255,255,0.35)"}}>
+          <div style={{position:"absolute",top:6,right:8,zIndex:3,fontFamily:"var(--mono)",fontSize:9,color:"var(--red)",animation:"blink 1.2s infinite",background:"rgba(7,16,22,0.46)",padding:"3px 6px",borderRadius:6}}>● REC</div>
+          <div style={{position:"absolute",bottom:5,left:0,right:0,display:"flex",justifyContent:"space-between",padding:"0 8px",zIndex:3,fontFamily:"var(--mono)",fontSize:8,color:"rgba(255,255,255,0.72)",textShadow:"0 1px 2px rgba(0,0,0,0.8)"}}>
             <span>CAM-0</span>
             <span>{liveConnected?`${(yoloDets||[]).length} DETS`:"OFFLINE"}</span>
             <span>YOLO·n</span>
@@ -163,10 +345,10 @@ function AudioBeams({ beams, mode }) {
     ctx.clearRect(0,0,W,H);
     const cx=W/2, cy=H*0.7, R=Math.min(W*0.4, H*0.6);
     // grid
-    ctx.strokeStyle="rgba(255,255,255,0.06)"; ctx.lineWidth=0.5;
+    ctx.strokeStyle="rgba(200,155,40,0.10)"; ctx.lineWidth=0.5;
     [0.33,0.66,1].forEach(f=>{ ctx.beginPath(); ctx.arc(cx,cy,R*f,Math.PI,0); ctx.stroke(); });
     // axes
-    ctx.strokeStyle="rgba(255,255,255,0.05)";
+    ctx.strokeStyle="rgba(200,155,40,0.07)";
     [180,225,270,315,360].forEach(d=>{
       const a = d*Math.PI/180;
       ctx.beginPath(); ctx.moveTo(cx,cy);
@@ -183,34 +365,34 @@ function AudioBeams({ beams, mode }) {
       const a = deg*Math.PI/180;
       const len = R*e;
       const hot = e>0.3;
-      ctx.strokeStyle = hot ? "#20C997" : "rgba(120,140,135,0.7)";
+      ctx.strokeStyle = hot ? "#0f9d8a" : "rgba(15,157,138,0.35)";
       ctx.lineWidth = 5;
       ctx.beginPath();
       ctx.moveTo(cx, cy);
       ctx.lineTo(cx+Math.cos(a)*len, cy+Math.sin(a)*len);
       ctx.stroke();
       // tip dot
-      ctx.fillStyle = hot ? "#00e5ff" : "rgba(180,200,195,0.6)";
+      ctx.fillStyle = hot ? "#28b5d4" : "rgba(114,129,149,0.45)";
       ctx.beginPath();
       ctx.arc(cx+Math.cos(a)*len, cy+Math.sin(a)*len, 3,0,Math.PI*2);
       ctx.fill();
       // label
-      ctx.fillStyle = "rgba(170,170,170,0.7)";
-      ctx.font = "9px 'IBM Plex Mono',monospace";
+      ctx.fillStyle = "rgba(185,155,70,0.70)";
+      ctx.font = "9px 'JetBrains Mono',monospace";
       ctx.textAlign="center";
       ctx.fillText(nm, cx+Math.cos(a)*(R+10), cy+Math.sin(a)*(R+10)+3);
     });
     // center
-    ctx.fillStyle = "#20C997";
+    ctx.fillStyle = "#0f9d8a";
     ctx.beginPath(); ctx.arc(cx,cy,3,0,Math.PI*2); ctx.fill();
   },[beams, mode]);
 
   return (
-    <div className="cell tactical">
+    <div className="cell">
       <div className="panel-hd">
-        <div className="ttl"><span className="tag">▸</span>AUDIO BEAMFORM</div>
+        <div className="ttl"><span className="tag">▸</span>Audio Beamform</div>
         <div className="meta">
-          <span>INMP441 ×4</span>
+          <span>MAX4466 ×4</span>
           <span>·</span>
           <span className="live">20HZ</span>
         </div>
@@ -261,9 +443,9 @@ function HapticLog({ events, expanded, setExpanded, onAck }) {
   },[events.length]);
 
   return (
-    <div className="cell area-log tactical">
+    <div className="cell area-log">
       <div className="panel-hd">
-        <div className="ttl"><span className="tag">▸</span>HAPTIC EVENT LOG</div>
+        <div className="ttl"><span className="tag">▸</span>Event Log</div>
         <div className="meta">
           <span>{events.length} EVT</span>
           <span>·</span>
@@ -281,10 +463,10 @@ function HapticLog({ events, expanded, setExpanded, onAck }) {
               <span className={"src "+ev.source.toLowerCase()}>{ev.source}</span>
             </div>
             <div className="pat">{patternFor(ev.urgency)}</div>
-            <div className="sub">{ev.distance.toFixed(1)}m · {ev.confidence}% · {ev.label.toLowerCase()}</div>
+            <div className="sub">{(ev.distance*3.28084).toFixed(0)}ft · {ev.confidence}% · {ev.label.toLowerCase()}</div>
             <div className="det">
               <div className="kv"><span>id</span><span>{ev.id}</span></div>
-              <div className="kv"><span>velocity</span><span>{ev.velocity>=0?"+":""}{ev.velocity.toFixed(2)} m/s</span></div>
+              <div className="kv"><span>velocity</span><span>{ev.velocity>=0?"+":""}{(ev.velocity*3.28084).toFixed(1)} ft/s</span></div>
               <div className="kv"><span>eta</span><span>{ev.eta.toFixed(1)}s</span></div>
               <div className="kv"><span>audio</span><span>{ev.audioClass}</span></div>
               <div className="kv"><span>visual</span><span>{ev.visualClass}</span></div>
@@ -308,9 +490,9 @@ function InfoRow({ threats, heading }) {
   const closest = threats.length ? [...threats].sort((a,b)=>a.distance-b.distance)[0] : null;
   const critCount = threats.filter(t=>t.urgency==="critical").length;
   return (
-    <div className="cell area-info tactical">
+    <div className="cell area-info">
       <div className="panel-hd">
-        <div className="ttl"><span className="tag">▸</span>NEAREST THREAT · IMU FUSION</div>
+        <div className="ttl"><span className="tag">▸</span>Nearest Threat</div>
         <div className="meta">
           <span>{threats.length} ACTIVE</span>
           <span>·</span>
@@ -329,7 +511,7 @@ function InfoRow({ threats, heading }) {
           <div className="k">Bearing / Range</div>
           <div className="v">
             {closest ? `${compass(closest.angle)}` : "—"}
-            <span className="u">{closest ? `${closest.distance.toFixed(1)} m` : ""}</span>
+            <span className="u">{closest ? `${(closest.distance*3.28084).toFixed(0)} ft` : ""}</span>
           </div>
           <div className={"ind "+(closest && closest.urgency==="critical"?"red":"teal")}>
             {closest ? `${Math.round(closest.angle)}° abs · ${Math.round(((closest.angle-heading+540)%360)-180)}° rel` : ""}
@@ -338,8 +520,8 @@ function InfoRow({ threats, heading }) {
         <div className="col">
           <div className="k">Closure / Conf</div>
           <div className="v">
-            {closest ? `${closest.velocity>=0?"+":""}${closest.velocity.toFixed(1)}` : "—"}
-            <span className="u">m/s</span>
+            {closest ? `${closest.velocity>=0?"+":""}${(closest.velocity*3.28084).toFixed(1)}` : "—"}
+            <span className="u">ft/s</span>
           </div>
           <div className="bars">
             {Array.from({length:10}).map((_,i)=>(
@@ -361,6 +543,7 @@ function StatusBar({ stat, beams, signal, muted }) {
   const pipeCls = stat.pipeline>8?"green":stat.pipeline>6?"yellow":"red";
   const yoloCls = stat.yolo<100?"green":stat.yolo<150?"yellow":"red";
   const tempCls = stat.temp<50?"green":stat.temp<60?"yellow":"red";
+  const cpuCls = (stat.cpu_pct||0)<60?"green":(stat.cpu_pct||0)<80?"yellow":"red";
   const sigCls = signal===4?"green":signal===3?"yellow":signal===2?"yellow":"red";
 
   // mic bar heights (24px max)
@@ -391,12 +574,12 @@ function StatusBar({ stat, beams, signal, muted }) {
         </span>
       </div>
       <div className="sb-item">
-        <span className="lbl">CPU</span>
+        <span className="lbl">TEMP</span>
         <span className={"val "+tempCls}>{stat.temp}°C</span>
       </div>
       <div className="sb-item">
-        <span className="lbl">BATT</span>
-        <span className="val">{stat.batt}%</span>
+        <span className="lbl">CPU</span>
+        <span className={"val "+cpuCls}>{stat.cpu_pct||0}%</span>
       </div>
       <div className="sb-item">
         <span className="lbl">HAPTIC</span>
@@ -548,13 +731,13 @@ function LiveCamPiP({ enabled, onClose, onRequestEnable }) {
   return (
     <div className="livecam">
       <video ref={videoRef} playsInline muted autoPlay/>
-      <div className="lc-recticle" />
+      <div className="lc-reticle" />
       <button className="lc-close" onClick={onClose} title="Close live cam">×</button>
       <div className="lc-hd">
         <span className={"nm "+(state==="live"?"":"off")}>
           {state==="live" ? "LIVE" : state==="requesting" ? "INIT" : "OFFLINE"}
         </span>
-        <span style={{color:"rgba(255,255,255,.7)"}}>OP-CAM</span>
+        <span style={{color:"var(--tx-2)"}}>OP-CAM</span>
       </div>
       {state==="live" && (
         <div className="lc-ft">
@@ -592,59 +775,4 @@ function LiveCamPiP({ enabled, onClose, onRequestEnable }) {
   );
 }
 
-// ─────────────────────────────────────────────
-// Pipeline Camera Feed — MJPEG stream from Pi with YOLO boxes
-// ─────────────────────────────────────────────
-function PipelineFeed({ liveConnected }) {
-  const [loaded, setLoaded] = useState(false);
-  const [err, setErr]       = useState(false);
-  const imgRef = useRef(null);
-  const _host = window.location.hostname || "raspberrypi.local";
-  const url = `http://${_host}:8090/video_feed`;
-
-  useEffect(() => {
-    if (!liveConnected) { setLoaded(false); setErr(false); return; }
-    if (imgRef.current) {
-      imgRef.current.src = "";
-      imgRef.current.src = url + "?t=" + Date.now();
-    }
-  }, [liveConnected]);
-
-  return (
-    <div className="panel pipeline-feed-panel">
-      <div className="panel-hd">
-        <span className="dot" style={{color: liveConnected && !err ? "var(--ac)" : "#E24B4A"}}>●</span>
-        <span className="ttl">PIPELINE CAM · YOLO</span>
-        <span style={{marginLeft:"auto", fontSize:9, letterSpacing:2, opacity:.55, color: liveConnected && !err ? "var(--ac)" : "#E24B4A"}}>
-          {liveConnected && !err ? "LIVE" : "OFFLINE"}
-        </span>
-      </div>
-      <div style={{position:"relative", background:"#000", borderRadius:3, overflow:"hidden", aspectRatio:"4/3"}}>
-        {!loaded && !err && (
-          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--ac)",fontSize:10,letterSpacing:2,opacity:.5}}>
-            CONNECTING…
-          </div>
-        )}
-        {err && (
-          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:6,color:"#E24B4A",fontSize:10,letterSpacing:2}}>
-            <span style={{fontSize:18}}>⊘</span><span>NO FEED</span>
-          </div>
-        )}
-        <img
-          ref={imgRef}
-          src={liveConnected ? url : ""}
-          onLoad={() => { setLoaded(true); setErr(false); }}
-          onError={() => { setErr(true); setLoaded(false); }}
-          style={{width:"100%",height:"100%",objectFit:"contain",display:loaded?"block":"none"}}
-          alt="pipeline feed"
-        />
-        {/* tactical corners */}
-        {[{top:4,left:4,borderTop:"1px solid",borderLeft:"1px solid"},{top:4,right:4,borderTop:"1px solid",borderRight:"1px solid"},{bottom:4,left:4,borderBottom:"1px solid",borderLeft:"1px solid"},{bottom:4,right:4,borderBottom:"1px solid",borderRight:"1px solid"}].map((s,i)=>(
-          <div key={i} style={{position:"absolute",width:10,height:10,borderColor:"var(--ac)",opacity:.5,...s}}/>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-Object.assign(window, { CameraFeed, AudioBeams, HapticLog, InfoRow, StatusBar, ThreatModal, LiveCamPiP, PipelineFeed });
+Object.assign(window, { CameraFeed, AudioBeams, HapticLog, InfoRow, StatusBar, ThreatModal, LiveCamPiP });

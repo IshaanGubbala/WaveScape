@@ -2,386 +2,554 @@
 
 const { useRef, useEffect, useMemo, useState, useCallback } = React;
 
-function RadarPanel({ threats, beams, heading, paused, sweepEnabled, onThreatClick, accent }) {
-  const canvasRef = useRef(null);
-  const wrapRef = useRef(null);
-  const [size, setSize] = useState(480);
-  const sweepRef = useRef(0);
-  const animRef = useRef(0);
-  // Refs so draw() never needs to be recreated when live data changes
-  const threatsRef = useRef(threats);
-  const beamsRef   = useRef(beams);
-  const headingRef = useRef(heading);
-  const sweepEnabledRef = useRef(sweepEnabled);
-  useEffect(()=>{ threatsRef.current = threats; }, [threats]);
-  useEffect(()=>{ beamsRef.current   = beams;   }, [beams]);
-  useEffect(()=>{ headingRef.current = heading; }, [heading]);
-  useEffect(()=>{ sweepEnabledRef.current = sweepEnabled; }, [sweepEnabled]);
-  const pausedRef = useRef(paused);
-  useEffect(()=>{ pausedRef.current = paused; }, [paused]);
+const DEFAULT_RADAR_RANGE_FT = 42;
+const MIN_RADAR_RANGE_FT = 5;
+const MAX_RADAR_RANGE_FT = 42;
+const RADAR_RANGE_PAD = 1.35;
+const M2FT = 3.28084;
 
-  // Observe wrap size for responsive canvas
-  useEffect(()=>{
-    const el = wrapRef.current;
-    if(!el) return;
-    const ro = new ResizeObserver(([entry])=>{
-      const w = entry.contentRect.width;
-      const s = Math.min(520, Math.max(280, w));
-      setSize(s);
+function radarThreats(threats) {
+  const valid = threats.filter(t => Number.isFinite(Number(t.distance)));
+  if (valid.length <= 1) return valid;
+
+  const strong = valid.filter(t => Number(t.confidence || 0) >= 20);
+  const pool = strong.length ? strong : valid.slice().sort((a, b) => (b.confidence || 0) - (a.confidence || 0)).slice(0, 1);
+
+  const out = [];
+  pool
+    .slice()
+    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+    .forEach(t => {
+      const duplicate = out.some(o => {
+        if (o.label !== t.label) return false;
+        const dAng = Math.abs((t.angle - o.angle + 180) % 360 - 180);
+        const dFt = Math.abs((t.distance - o.distance) * M2FT);
+        // Wider distance window to dedup same object — but angular separation
+        // (>20°) means different object, so always show even if same label.
+        return dAng < 20 && dFt < 3.5;
+      });
+      if (!duplicate) out.push(t);
     });
+  return out.slice(0, 6);
+}
+
+function radarRangeFt(threats) {
+  const dists = [];
+  threats.forEach(t => {
+    // Receding-only threats don't drive zoom — they're leaving
+    if (t.receding && !t.approaching) return;
+    const dist = Number(t.distance);
+    if (Number.isFinite(dist)) dists.push(dist * M2FT);
+    (t.predicted || []).forEach(p => {
+      if (p.impact) return;
+      const predicted = Number(p.dist_m);
+      if (Number.isFinite(predicted)) dists.push(predicted * M2FT);
+    });
+  });
+  if (!dists.length) return DEFAULT_RADAR_RANGE_FT;
+  dists.sort((a, b) => a - b);
+  // Use median-of-nearest-two to dampen single-frame distance jitter
+  const anchor = dists.length >= 2 ? (dists[0] + dists[1]) / 2 : dists[0];
+  const farthest = dists[dists.length - 1];
+  // 3.5× multiplier: less aggressive zoom, less sensitive to small distance changes
+  const focus = Math.max(MIN_RADAR_RANGE_FT, anchor * 3.5);
+  const ceiling = Math.min(MAX_RADAR_RANGE_FT, farthest * 1.3);
+  return Math.min(ceiling, focus);
+}
+
+function RadarPanel({ threats, beams, heading, paused, sweepEnabled, onThreatClick }) {
+  const canvasRef = useRef(null);
+  const wrapRef   = useRef(null);
+  const panelRef  = useRef(null);
+  const [size, setSize] = useState(480);
+  const [displayRange, setDisplayRange] = useState(DEFAULT_RADAR_RANGE_FT);
+  const sweepRef  = useRef(0);
+  const animRef   = useRef(0);
+  const visibleThreats = useMemo(() => radarThreats(threats), [threats]);
+
+  const threatsRef     = useRef(visibleThreats);
+  const beamsRef       = useRef(beams);
+  const headingRef     = useRef(heading);
+  const sweepEnRef     = useRef(sweepEnabled);
+  const pausedRef      = useRef(paused);
+  useEffect(()=>{ threatsRef.current  = visibleThreats; }, [visibleThreats]);
+  useEffect(()=>{ beamsRef.current    = beams;         }, [beams]);
+  useEffect(()=>{ headingRef.current  = heading;       }, [heading]);
+  useEffect(()=>{ sweepEnRef.current  = sweepEnabled;  }, [sweepEnabled]);
+  useEffect(()=>{ pausedRef.current   = paused;        }, [paused]);
+
+  useEffect(()=>{
+    const el = wrapRef.current; if(!el) return;
+    const updateSize = (width) => {
+      const panel = panelRef.current?.getBoundingClientRect();
+      const heightLimit = panel ? panel.height - 104 : window.innerHeight * 0.52;
+      const available = Math.min(width, Math.max(280, heightLimit));
+      const next = Math.round(Math.min(500, Math.max(260, available)));
+      setSize(current => current === next ? current : next);
+    };
+    const ro = new ResizeObserver(([e])=>updateSize(e.contentRect.width));
     ro.observe(el);
-    return ()=>ro.disconnect();
+    const onResize = () => updateSize(el.getBoundingClientRect().width);
+    window.addEventListener("resize", onResize, { passive: true });
+    return ()=>{
+      window.removeEventListener("resize", onResize);
+      ro.disconnect();
+    };
   },[]);
 
-  const draw = useCallback(()=>{
+  const rangeRef       = useRef(displayRange);
+  const targetRangeRef = useRef(displayRange);
+  const threatPoolRef  = useRef({});
+
+  // Target range is updated inside draw() at 60fps from pool distances.
+
+  // Sync display label + hit overlay at ~8Hz — avoids per-frame re-renders
+  useEffect(()=>{
+    const id = setInterval(()=>setDisplayRange(rangeRef.current), 120);
+    return ()=>clearInterval(id);
+  }, []);
+
+  const draw = useCallback((dt=16)=>{
     const c = canvasRef.current; if(!c) return;
-    // Read live data from refs — stable closure, no rAF restarts on data changes
-    const threats = threatsRef.current;
-    const beams   = beamsRef.current;
-    const heading = headingRef.current;
-    const sweepEnabled = sweepEnabledRef.current;
-    const dpr = window.devicePixelRatio || 1;
-    const css = size;
-    if(c.width !== css*dpr){ c.width = css*dpr; c.height = css*dpr; c.style.width = css+"px"; c.style.height = css+"px"; }
+    const threats    = threatsRef.current;
+    const beams      = beamsRef.current;
+    const heading    = headingRef.current;
+    const sweepOn    = sweepEnRef.current;
+    const dpr        = window.devicePixelRatio || 1;
+    const css        = size;
+    if(c.width !== css*dpr){ c.width = css*dpr; c.height = css*dpr; c.style.width=css+"px"; c.style.height=css+"px"; }
     const ctx = c.getContext("2d");
     ctx.setTransform(dpr,0,0,dpr,0,0);
     ctx.clearRect(0,0,css,css);
 
     const cx = css/2, cy = css/2;
-    const maxR = css*0.46;
-    const distMax = 15; // m
+    const maxR = css * 0.445;
+    const toFt = m => m * M2FT;
+    const now  = Date.now();
+    const RFT = rangeRef.current;
 
-    // Background subtle vignette
-    const g = ctx.createRadialGradient(cx,cy,0,cx,cy,maxR);
-    g.addColorStop(0,"rgba(32,201,151,0.05)");
-    g.addColorStop(1,"rgba(0,0,0,0)");
-    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(cx,cy,maxR,0,Math.PI*2); ctx.fill();
+    // ── Radar disc ──
+    ctx.beginPath(); ctx.arc(cx,cy,maxR+1,0,Math.PI*2);
+    ctx.fillStyle = "#202733"; ctx.fill();
 
-    // Rings
-    const rings = [2,5,10,15];
-    ctx.lineWidth = 0.5;
-    ctx.strokeStyle = "rgba(255,255,255,0.07)";
-    rings.forEach(d=>{
-      const r = (d/distMax)*maxR;
-      ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.stroke();
+    // Vignette
+    const vig = ctx.createRadialGradient(cx,cy,0,cx,cy,maxR);
+    vig.addColorStop(0,"rgba(15,157,138,0.12)");
+    vig.addColorStop(0.6,"rgba(15,157,138,0.04)");
+    vig.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.fillStyle=vig; ctx.beginPath(); ctx.arc(cx,cy,maxR,0,Math.PI*2); ctx.fill();
+
+    // ── Rings ──
+    const rStep = RFT<=8?1:RFT<=20?5:RFT<=40?10:15;
+    const rings = [];
+    for(let ft=rStep; ft<=RFT; ft+=rStep) rings.push(Math.round(ft));
+
+    rings.forEach((ft,i)=>{
+      const r=(ft/RFT)*maxR, last=i===rings.length-1;
+      ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2);
+      ctx.strokeStyle = last?"rgba(15,157,138,0.30)":"rgba(15,23,42,0.08)";
+      ctx.lineWidth   = last?1:0.5;
+      ctx.stroke();
     });
 
-    // Quadrant dividers (45/135/225/315)
-    ctx.strokeStyle = "rgba(255,255,255,0.045)";
-    ctx.lineWidth = 0.5;
-    for(let a=45;a<360;a+=90){
-      const rad = (a-90)*Math.PI/180;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(cx + Math.cos(rad)*maxR, cy + Math.sin(rad)*maxR);
-      ctx.stroke();
-    }
+    // ── Diagonal spokes ──
+    ctx.strokeStyle="rgba(15,157,138,0.05)"; ctx.lineWidth=0.5;
+    [45,135,225,315].forEach(a=>{
+      const rad=(a-90)*Math.PI/180;
+      ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+Math.cos(rad)*maxR,cy+Math.sin(rad)*maxR); ctx.stroke();
+    });
 
-    // Cross axes
-    ctx.strokeStyle = "rgba(32,201,151,0.18)";
-    ctx.setLineDash([2,4]);
-    ctx.beginPath(); ctx.moveTo(cx, cy-maxR); ctx.lineTo(cx, cy+maxR); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(cx-maxR, cy); ctx.lineTo(cx+maxR, cy); ctx.stroke();
+    // ── Cardinal axes (dashed teal) ──
+    ctx.setLineDash([2,6]); ctx.strokeStyle="rgba(15,157,138,0.16)"; ctx.lineWidth=0.7;
+    ctx.beginPath(); ctx.moveTo(cx,cy-maxR); ctx.lineTo(cx,cy+maxR); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx-maxR,cy); ctx.lineTo(cx+maxR,cy); ctx.stroke();
     ctx.setLineDash([]);
 
-    // Distance ring labels
-    ctx.fillStyle = "rgba(170,170,170,0.55)";
-    ctx.font = "9px 'IBM Plex Mono',monospace";
-    ctx.textAlign = "left"; ctx.textBaseline = "middle";
-    rings.forEach(d=>{
-      const r = (d/distMax)*maxR;
-      ctx.fillText(d+"m", cx+4, cy - r);
+    // ── Ring distance labels (right side only, pill bg) ──
+    ctx.font="bold 8px 'JetBrains Mono',monospace"; ctx.textAlign="left"; ctx.textBaseline="middle";
+    rings.forEach((ft,i)=>{
+      if(rings.length>4 && i%2!==0) return;
+      const r=(ft/RFT)*maxR, lbl=ft+"ft";
+      const lx=cx+6, ly=cy-r;
+      const tw=ctx.measureText(lbl).width;
+      ctx.fillStyle="rgba(255,255,255,0.84)"; ctx.fillRect(lx-2,ly-6,tw+4,12);
+      ctx.fillStyle="rgba(15,23,42,0.82)"; ctx.fillText(lbl,lx,ly);
     });
 
-    // (compass labels drawn AFTER wedges — see below)
-
-    // Audio beam wedges (35,145,215,325) — drawn UNDER labels later
-    const beamEntries = [
-      ["front", beams.front, 35],
-      ["right", beams.right, 145],
-      ["back",  beams.back,  215],
-      ["left",  beams.left,  325],
-    ];
-    beamEntries.forEach(([k,e,centerDeg])=>{
-      const half = 22*Math.PI/180; // 44 degree cone
-      const ang = (centerDeg-90)*Math.PI/180;
-      const r = maxR*0.95;
-      const op = 0.05 + e*0.18;
-      // Gradient fade outward
-      const grad = ctx.createRadialGradient(cx,cy,0,cx,cy,r);
-      grad.addColorStop(0, `rgba(32,201,151,${(op*1.4).toFixed(3)})`);
-      grad.addColorStop(1, `rgba(32,201,151,0)`);
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.arc(cx, cy, r, ang-half, ang+half);
-      ctx.closePath();
-      ctx.fill();
-      // Beam edge stroke
-      ctx.strokeStyle = `rgba(32,201,151,${(0.12+e*0.3).toFixed(3)})`;
-      ctx.lineWidth = 0.5;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(cx+Math.cos(ang-half)*r, cy+Math.sin(ang-half)*r);
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(cx+Math.cos(ang+half)*r, cy+Math.sin(ang+half)*r);
-      ctx.stroke();
-      // Energy arc at outer edge
-      if(e>0.15){
-        ctx.strokeStyle = `rgba(0,229,255,${(e*0.5).toFixed(3)})`;
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        ctx.arc(cx, cy, r*0.96, ang-half, ang+half);
-        ctx.stroke();
+    // ── Audio beam wedges ──
+    const beamDirs=[["front",beams.front,0],["right",beams.right,90],["back",beams.back,180],["left",beams.left,270]];
+    beamDirs.forEach(([,e,deg])=>{
+      const half=22*Math.PI/180, ang=(deg-90)*Math.PI/180, r=maxR*0.94;
+      const op=0.03+e*0.12;
+      const g=ctx.createRadialGradient(cx,cy,0,cx,cy,r);
+      g.addColorStop(0,`rgba(15,157,138,${(op*1.5).toFixed(3)})`);
+      g.addColorStop(1,"rgba(15,157,138,0)");
+      ctx.fillStyle=g; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,ang-half,ang+half); ctx.closePath(); ctx.fill();
+      if(e>0.2){
+        ctx.strokeStyle=`rgba(40,181,212,${(e*0.35).toFixed(3)})`; ctx.lineWidth=0.8;
+        ctx.beginPath(); ctx.arc(cx,cy,r*0.95,ang-half,ang+half); ctx.stroke();
       }
     });
 
-    // Compass labels (on top of beams)
-    ctx.fillStyle = "rgba(207,207,207,0.95)";
-    ctx.font = "600 10px 'IBM Plex Mono',monospace";
-    ctx.textAlign = "center"; ctx.textBaseline = "middle";
-    ctx.fillText("FRONT", cx, cy - maxR - 12);
-    ctx.fillText("BACK",  cx, cy + maxR + 12);
-    ctx.fillText("LEFT",  cx - maxR - 18, cy);
-    ctx.fillText("RIGHT", cx + maxR + 20, cy);
+    // ── Compass labels ──
+    ctx.font="600 9px 'Inter',sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillStyle="rgba(15,157,138,0.72)";
+    ctx.fillText("FWD",  cx,       cy-maxR-13);
+    ctx.fillText("REAR", cx,       cy+maxR+13);
+    ctx.fillText("L",    cx-maxR-13, cy);
+    ctx.fillText("R",    cx+maxR+13, cy);
 
-    // Sweep (rotating gradient)
-    if(sweepEnabled){
-      const sweep = sweepRef.current;
-      const startA = (sweep - 90)*Math.PI/180;
-      const endA = (sweep - 90 - 40)*Math.PI/180;
-      const grd = ctx.createConicGradient ? ctx.createConicGradient(startA, cx, cy) : null;
-      // Use polygonal trail fallback
-      const steps = 24;
+    // ── Sweep ──
+    if(sweepOn){
+      const startA=(sweepRef.current-90)*Math.PI/180;
+      const steps=30;
       for(let i=0;i<steps;i++){
-        const t = i/steps;
-        const a0 = startA - (40*Math.PI/180)*t;
-        const a1 = startA - (40*Math.PI/180)*(t+1/steps);
-        const alpha = (1-t)*0.18;
-        ctx.fillStyle = `rgba(32,201,151,${alpha.toFixed(3)})`;
-        ctx.beginPath();
-        ctx.moveTo(cx,cy);
-        ctx.arc(cx,cy,maxR,a0,a1,true);
-        ctx.closePath();
-        ctx.fill();
+        const tv=i/steps;
+        const a0=startA-(50*Math.PI/180)*tv;
+        const a1=startA-(50*Math.PI/180)*(tv+1/steps);
+        ctx.fillStyle=`rgba(15,157,138,${((1-tv)*0.13).toFixed(3)})`;
+        ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,maxR,a0,a1,true); ctx.closePath(); ctx.fill();
       }
-      // Leading edge
-      ctx.strokeStyle = "rgba(0,229,255,0.55)";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(cx,cy);
-      ctx.lineTo(cx+Math.cos(startA)*maxR, cy+Math.sin(startA)*maxR);
-      ctx.stroke();
+      ctx.strokeStyle="rgba(15,157,138,0.55)"; ctx.lineWidth=1.2;
+      ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+Math.cos(startA)*maxR,cy+Math.sin(startA)*maxR); ctx.stroke();
     }
 
-    // Escape direction arrow (from Mac planner / stereo)
-    if(heading !== 0){
-      const hRad = (heading - 90)*Math.PI/180;
-      const arrowLen = maxR * 0.72;
-      const ex = cx+Math.cos(hRad)*arrowLen, ey = cy+Math.sin(hRad)*arrowLen;
-      // Glow trail
-      ctx.strokeStyle = "rgba(32,201,151,0.15)";
-      ctx.lineWidth = 10;
-      ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(ex,ey); ctx.stroke();
-      // Main line
-      ctx.strokeStyle = "#20C997";
-      ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(ex,ey); ctx.stroke();
-      // Arrowhead
-      const headLen = 10, headAngle = 0.42;
-      ctx.fillStyle = "#20C997";
-      ctx.beginPath();
-      ctx.moveTo(ex, ey);
-      ctx.lineTo(ex - headLen*Math.cos(hRad-headAngle), ey - headLen*Math.sin(hRad-headAngle));
-      ctx.lineTo(ex - headLen*Math.cos(hRad+headAngle), ey - headLen*Math.sin(hRad+headAngle));
-      ctx.closePath(); ctx.fill();
-      // Label
-      ctx.font = "bold 9px 'IBM Plex Mono',monospace";
-      ctx.fillStyle = "rgba(32,201,151,0.9)";
-      ctx.textAlign = "center"; ctx.textBaseline = "middle";
-      const lx = cx+Math.cos(hRad)*(arrowLen+14), ly = cy+Math.sin(hRad)*(arrowLen+14);
-      ctx.fillText("GO", lx, ly);
+    // ── Threat pool: stable identity + 60fps position lerp ──
+    // Matches incoming SSE threats to existing pool entries by label+proximity,
+    // lerps rendered position toward target so blips glide rather than snap.
+    {
+      const TAU_MS  = 200; // position time constant — reaches ~63% in 200ms
+      const FADE_MS = 1400;
+      const lerpK   = 1 - Math.exp(-dt / TAU_MS);
+      const pool    = threatPoolRef.current;
+
+      for (const p of Object.values(pool)) p._seen = false;
+
+      for (const t of threats) {
+        let bestKey = null, bestScore = Infinity;
+        for (const [pk, p] of Object.entries(pool)) {
+          if (p._seen || p.label !== t.label) continue;
+          const dA = Math.abs(((t.angle - p.angle) + 540) % 360 - 180);
+          const dD = Math.abs(t.distance - p.dist);
+          if (dA < 28 && dD < 5) {
+            const score = dA + dD * 2;
+            if (score < bestScore) { bestScore = score; bestKey = pk; }
+          }
+        }
+        if (bestKey) {
+          const p = pool[bestKey];
+          p._seen = true; p.lastSeen = now;
+          p.targetDist = t.distance; p.targetAngle = t.angle;
+          p.urgency = t.urgency; p.confidence = t.confidence;
+          p.approaching = t.approaching; p.receding = t.receding;
+          p.coasting = t.coasting; p.crossing = t.crossing;
+          p.predicted = t.predicted || []; p.vDist = t.vDist || 0; p.vAngle = t.vAngle || 0;
+          p.velocity = t.velocity; p.eta = t.eta; p.type = t.type; p.source = t.source;
+        } else {
+          const key = t.label + '_' + Math.random().toString(36).slice(2);
+          pool[key] = {
+            key, label: t.label, type: t.type,
+            dist: t.distance, angle: t.angle,
+            targetDist: t.distance, targetAngle: t.angle,
+            vDist: t.vDist||0, vAngle: t.vAngle||0,
+            bornAt: now, lastSeen: now,
+            urgency: t.urgency, confidence: t.confidence,
+            approaching: t.approaching, receding: t.receding,
+            coasting: t.coasting, crossing: t.crossing,
+            predicted: t.predicted||[], velocity: t.velocity, eta: t.eta,
+            source: t.source, _seen: true,
+          };
+        }
+      }
+
+      for (const [pk, p] of Object.entries(pool)) {
+        if (!p._seen && now - p.lastSeen > FADE_MS) { delete pool[pk]; continue; }
+        const dA = ((p.targetAngle - p.angle) + 540) % 360 - 180;
+        p.angle = (p.angle + dA * lerpK + 360) % 360;
+        p.dist  = Math.max(0.1, p.dist + (p.targetDist - p.dist) * lerpK);
+      }
+
+      threatPoolRef._FADE_MS = FADE_MS;
+
+      targetRangeRef.current = 10;
     }
 
-    // Threats (fade in/out by age)
-    const now = Date.now();
-    threats.forEach(t=>{
-      const age = now - t.bornAt;
-      let alpha = 1;
-      if(age < 200) alpha = age/200;
-      else if(age > t.ttl - 300) alpha = Math.max(0,(t.ttl - age)/300);
-      if(t.coasting) alpha *= 0.4;
-      // Extrapolate position using velocity × time since last server update
-      const dtS = Math.min((now - (t._rx || now)) / 1000, 0.15); // cap at 150ms
-      const smoothDist  = Math.max(0.3, t.distance + (t.vDist  || 0) * dtS);
-      const smoothAngle = ((t.angle   + (t.vAngle || 0) * dtS) + 360) % 360;
-      const r = (Math.min(distMax, smoothDist)/distMax)*maxR;
-      const angRad = (smoothAngle - 90)*Math.PI/180;
-      const tx = cx + Math.cos(angRad)*r;
-      const ty = cy + Math.sin(angRad)*r;
-      const col = {critical:"#E24B4A", high:"#BA7517", medium:"#FFD54F", low:"#888888"}[t.urgency];
+    // ── Threats ──
+    Object.values(threatPoolRef.current).forEach(t=>{
+      ctx.setLineDash([]); ctx.lineWidth=1; ctx.globalAlpha=1;
 
-      // Predicted trajectory trail — draw before the main dot so it's underneath
-      if(t.predicted && t.predicted.length > 0){
-        // Dashed line along predicted path
-        ctx.setLineDash([2,3]);
-        ctx.strokeStyle = `rgba(255,255,255,0.18)`;
-        ctx.lineWidth = 0.8;
-        ctx.beginPath();
-        ctx.moveTo(tx, ty);
-        t.predicted.forEach(p=>{
-          const pr = (Math.min(distMax, p.dist_m)/distMax)*maxR;
-          const pa = (p.angle_deg - 90)*Math.PI/180;
-          ctx.lineTo(cx + Math.cos(pa)*pr, cy + Math.sin(pa)*pr);
+      const FADE_MS = threatPoolRef._FADE_MS || 1400;
+      const age     = now - t.bornAt;
+      const fadeAge = now - t.lastSeen;
+      let alpha = Math.min(1, age / 250);
+      if (!t._seen) alpha *= Math.max(0, 1 - fadeAge / FADE_MS);
+      if (t.coasting) alpha *= 0.4;
+
+      const r=(Math.min(RFT,toFt(t.dist))/RFT)*maxR;
+      const angRad=(t.angle-90)*Math.PI/180;
+      const tx=cx+Math.cos(angRad)*r, ty=cy+Math.sin(angRad)*r;
+
+      // urgency → color + dot size
+      const urgCfg = {
+        critical: { fill:"#dd4d5b", stroke:"rgba(221,77,91,0.5)",  r:12 },
+        high:     { fill:"#f08a24", stroke:"rgba(240,138,36,0.35)", r:10 },
+        medium:   { fill:"#28b5d4", stroke:"rgba(40,181,212,0.25)",  r:8  },
+        low:      { fill:"#728195", stroke:"rgba(114,129,149,0.15)", r:7 },
+      }[t.urgency] || { fill:"#728195", stroke:"rgba(114,129,149,0.15)", r:7 };
+
+      // ── Prediction trail ──
+      if(t.predicted && t.predicted.length>0){
+        const pts=t.predicted.filter(p=>!p.impact).map(p=>{
+          const pr=(Math.min(RFT,toFt(p.dist_m))/RFT)*maxR;
+          const pa=(p.angle_deg-90)*Math.PI/180;
+          return {x:cx+Math.cos(pa)*pr, y:cy+Math.sin(pa)*pr, conf:p.conf||0.5};
         });
-        ctx.stroke();
-        ctx.setLineDash([]);
-        // Ghost dots at each predicted position
-        t.predicted.forEach((p, i)=>{
-          const pr = (Math.min(distMax, p.dist_m)/distMax)*maxR;
-          const pa = (p.angle_deg - 90)*Math.PI/180;
-          const px = cx + Math.cos(pa)*pr, py = cy + Math.sin(pa)*pr;
-          const ghostAlpha = 0.35 - i*0.07;
-          ctx.beginPath();
-          ctx.arc(px, py, 4, 0, Math.PI*2);
-          ctx.fillStyle = col + Math.round(Math.max(0,ghostAlpha)*255).toString(16).padStart(2,"0");
-          ctx.fill();
-        });
+        if(pts.length>0){
+          const tRGB = t.approaching?"220,70,70": t.receding?"10,200,140":"140,155,150";
+          const tOp  = t.approaching?0.70: t.receding?0.45:0.25;
+
+          // Soft glow behind trail for approaching
+          if(t.approaching && pts.length>0){
+            ctx.strokeStyle=`rgba(${tRGB},${(tOp*0.25*alpha).toFixed(2)})`;
+            ctx.lineWidth=7; ctx.setLineDash([]);
+            ctx.beginPath(); ctx.moveTo(tx,ty);
+            pts.forEach((p,i)=>{ if(i<pts.length-1){const mx=(p.x+pts[i+1].x)/2,my=(p.y+pts[i+1].y)/2; ctx.quadraticCurveTo(p.x,p.y,mx,my);} else ctx.lineTo(p.x,p.y);});
+            ctx.stroke();
+          }
+
+          // Centerline
+          ctx.strokeStyle=`rgba(${tRGB},${(tOp*alpha).toFixed(2)})`;
+          ctx.lineWidth=t.approaching?2:1.2;
+          ctx.setLineDash(t.receding?[4,5]:[]);
+          ctx.beginPath(); ctx.moveTo(tx,ty);
+          if(pts.length===1){ ctx.lineTo(pts[0].x,pts[0].y); }
+          else { for(let i=0;i<pts.length-1;i++){const mx=(pts[i].x+pts[i+1].x)/2,my=(pts[i].y+pts[i+1].y)/2; ctx.quadraticCurveTo(pts[i].x,pts[i].y,mx,my);} ctx.lineTo(pts[pts.length-1].x,pts[pts.length-1].y); }
+          ctx.stroke(); ctx.setLineDash([]);
+
+          // Ghost dots
+          pts.forEach((p,i)=>{
+            const conf=p.conf??(1-i/pts.length*0.7);
+            const dR=Math.max(1.5,4*conf), dA=conf*0.55*alpha;
+            ctx.beginPath(); ctx.arc(p.x,p.y,dR,0,Math.PI*2);
+            ctx.fillStyle=`rgba(${tRGB},${dA.toFixed(2)})`; ctx.fill();
+          });
+        }
+
+        // Impact X marker
+        const impact=t.predicted.find(p=>p.impact);
+        if(impact){
+          const iRad=(impact.angle_deg-90)*Math.PI/180;
+          // impact.dist_m=0 → collision at user position (center); small offset for visibility
+          const iR=Math.max(8,(Math.min(RFT,toFt(impact.dist_m||0))/RFT)*maxR);
+          const ix=cx+Math.cos(iRad)*iR, iy=cy+Math.sin(iRad)*iR, xs=6;
+          ctx.strokeStyle=`rgba(255,60,60,${(0.9*alpha).toFixed(2)})`;
+          ctx.lineWidth=2.5; ctx.setLineDash([]);
+          ctx.beginPath(); ctx.moveTo(ix-xs,iy-xs); ctx.lineTo(ix+xs,iy+xs);
+          ctx.moveTo(ix+xs,iy-xs); ctx.lineTo(ix-xs,iy+xs); ctx.stroke();
+          if(impact.dt_s<5){
+            ctx.font="700 8px system-ui,sans-serif"; ctx.textAlign="center"; ctx.textBaseline="bottom";
+            ctx.fillStyle=`rgba(255,100,100,${(0.95*alpha).toFixed(2)})`;
+            ctx.fillText(impact.dt_s.toFixed(1)+"s", ix, iy-8);
+          }
+        }
       }
 
-      // Outer pulse for critical
-      if(t.urgency==="critical"){
-        const pulse = 1 + 0.4*Math.sin(now/180);
-        ctx.beginPath();
-        ctx.arc(tx, ty, 14*pulse, 0, Math.PI*2);
-        ctx.fillStyle = `rgba(226,75,74,${(0.18*alpha).toFixed(3)})`;
-        ctx.fill();
+      // ── Approach pulse ──
+      if(t.approaching){
+        const pulse=1+0.4*Math.sin(now/140);
+        ctx.beginPath(); ctx.arc(tx,ty,(urgCfg.r+6)*pulse,0,Math.PI*2);
+        ctx.fillStyle=`rgba(220,70,70,${(0.16*alpha).toFixed(3)})`; ctx.fill();
       }
-      // Shape: diamond for crossing, circle for approaching/static
+      if(t.urgency==="critical" && !t.approaching){
+        const pulse=1+0.25*Math.sin(now/220);
+        ctx.beginPath(); ctx.arc(tx,ty,(urgCfg.r+4)*pulse,0,Math.PI*2);
+        ctx.fillStyle=`rgba(220,70,70,${(0.10*alpha).toFixed(3)})`; ctx.fill();
+      }
+
+      // Outer urgency glow ring
+      ctx.beginPath(); ctx.arc(tx,ty,urgCfg.r+3,0,Math.PI*2);
+      ctx.strokeStyle=urgCfg.stroke.replace("0.5","0.45").replace("0.35","0.3").replace("0.25","0.2").replace("0.15","0.1");
+      ctx.lineWidth=4; ctx.stroke();
+
+      // ── Threat shape ──
       ctx.beginPath();
       if(t.crossing){
-        const s = 11;
-        ctx.moveTo(tx, ty-s); ctx.lineTo(tx+s, ty);
-        ctx.lineTo(tx, ty+s); ctx.lineTo(tx-s, ty); ctx.closePath();
+        const s=urgCfg.r;
+        ctx.moveTo(tx,ty-s); ctx.lineTo(tx+s,ty); ctx.lineTo(tx,ty+s); ctx.lineTo(tx-s,ty); ctx.closePath();
+      } else if(t.receding){
+        const s=urgCfg.r;
+        const tip={x:tx+Math.cos(angRad)*s*1.5, y:ty+Math.sin(angRad)*s*1.5};
+        const base={x:tx+Math.cos(angRad)*(-s*0.3), y:ty+Math.sin(angRad)*(-s*0.3)};
+        ctx.moveTo(tip.x,tip.y);
+        ctx.lineTo(base.x+Math.cos(angRad+Math.PI/2)*s, base.y+Math.sin(angRad+Math.PI/2)*s);
+        ctx.lineTo(base.x+Math.cos(angRad-Math.PI/2)*s, base.y+Math.sin(angRad-Math.PI/2)*s);
+        ctx.closePath();
       } else {
-        ctx.arc(tx, ty, 11, 0, Math.PI*2);
-      }
-      ctx.fillStyle = col + Math.round(alpha*255).toString(16).padStart(2,"0");
-      ctx.fill();
-      ctx.strokeStyle = `rgba(0,0,0,${(0.5*alpha).toFixed(3)})`;
-      ctx.lineWidth = 1;
-      ctx.stroke();
-
-      // Crossing: draw lateral arrow to show direction of travel
-      if(t.crossing && t.vAngle){
-        const arrowLen = Math.min(20, Math.abs(t.vAngle) * 0.3);
-        const dir = t.vAngle > 0 ? 1 : -1;  // positive vAngle = moving clockwise
-        const perpRad = angRad + Math.PI/2;  // perpendicular to radial = tangential
-        ctx.beginPath();
-        ctx.moveTo(tx, ty);
-        const ex = tx + Math.cos(perpRad)*arrowLen*dir;
-        const ey = ty + Math.sin(perpRad)*arrowLen*dir;
-        ctx.lineTo(ex, ey);
-        ctx.strokeStyle = col + Math.round(alpha*200).toString(16).padStart(2,"0");
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        // arrowhead
-        const ah = 5;
-        ctx.beginPath();
-        ctx.moveTo(ex, ey);
-        ctx.lineTo(ex - Math.cos(perpRad-0.5)*ah*dir, ey - Math.sin(perpRad-0.5)*ah*dir);
-        ctx.moveTo(ex, ey);
-        ctx.lineTo(ex - Math.cos(perpRad+0.5)*ah*dir, ey - Math.sin(perpRad+0.5)*ah*dir);
-        ctx.stroke();
+        ctx.arc(tx,ty,urgCfg.r,0,Math.PI*2);
       }
 
-      // Icon
-      ctx.font = "12px serif";
-      ctx.textAlign = "center"; ctx.textBaseline = "middle";
-      ctx.fillStyle = `rgba(0,0,0,${(0.85*alpha).toFixed(3)})`;
-      ctx.fillText(t.icon, tx, ty+0.5);
+      if(t.receding){
+        ctx.fillStyle=`rgba(15,157,138,${(0.12*alpha).toFixed(3)})`;
+        ctx.strokeStyle=`rgba(15,157,138,${(0.90*alpha).toFixed(3)})`;
+        ctx.lineWidth=1.8; ctx.fill(); ctx.stroke();
+      } else {
+        // Fill with urgency color + inner highlight
+        ctx.fillStyle=urgCfg.fill+Math.round(alpha*230).toString(16).padStart(2,"0");
+        ctx.fill();
+        // Inner highlight top
+        const hi=ctx.createRadialGradient(tx-urgCfg.r*0.3,ty-urgCfg.r*0.3,0,tx,ty,urgCfg.r);
+        hi.addColorStop(0,`rgba(255,255,255,${(0.25*alpha).toFixed(2)})`);
+        hi.addColorStop(1,"rgba(255,255,255,0)");
+        ctx.fillStyle=hi; ctx.fill();
+        // Border
+      ctx.strokeStyle=`rgba(31,41,55,${(0.28*alpha).toFixed(3)})`;
+        ctx.lineWidth=1; ctx.stroke();
+      }
 
-      // Confidence label
-      ctx.font = "8.5px 'IBM Plex Mono',monospace";
-      ctx.fillStyle = `rgba(255,255,255,${(0.85*alpha).toFixed(3)})`;
-      ctx.fillText(t.confidence+"%", tx, ty+18);
+      // ── Velocity arrow ──
+      ctx.setLineDash([]); ctx.lineWidth=1;
+      if(t.approaching && Math.abs(t.vDist||0)>0.08){
+        const al=Math.min(24,Math.abs(t.vDist)*8);
+        const ex=tx+Math.cos(angRad+Math.PI)*al, ey=ty+Math.sin(angRad+Math.PI)*al;
+        ctx.strokeStyle=`rgba(255,80,80,${(0.95*alpha).toFixed(2)})`; ctx.lineWidth=2.5;
+        ctx.beginPath(); ctx.moveTo(tx,ty); ctx.lineTo(ex,ey); ctx.stroke();
+        ctx.fillStyle=`rgba(255,80,80,${(0.95*alpha).toFixed(2)})`;
+        ctx.beginPath();
+        ctx.moveTo(ex,ey);
+        ctx.lineTo(ex-Math.cos(angRad+Math.PI-0.42)*7,ey-Math.sin(angRad+Math.PI-0.42)*7);
+        ctx.lineTo(ex-Math.cos(angRad+Math.PI+0.42)*7,ey-Math.sin(angRad+Math.PI+0.42)*7);
+        ctx.closePath(); ctx.fill();
+      } else if(t.receding && Math.abs(t.vDist||0)>0.08){
+        const al=Math.min(22,Math.abs(t.vDist)*7);
+        const ex=tx+Math.cos(angRad)*al, ey=ty+Math.sin(angRad)*al;
+        ctx.strokeStyle=`rgba(15,157,138,${(0.7*alpha).toFixed(2)})`; ctx.lineWidth=1.5;
+        ctx.setLineDash([3,3]); ctx.beginPath(); ctx.moveTo(tx,ty); ctx.lineTo(ex,ey); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle=`rgba(15,157,138,${(0.7*alpha).toFixed(2)})`;
+        ctx.beginPath();
+        ctx.moveTo(ex,ey);
+        ctx.lineTo(ex-Math.cos(angRad-0.42)*6,ey-Math.sin(angRad-0.42)*6);
+        ctx.lineTo(ex-Math.cos(angRad+0.42)*6,ey-Math.sin(angRad+0.42)*6);
+        ctx.closePath(); ctx.fill();
+      } else if(t.crossing && t.vAngle){
+        const al=Math.min(18,Math.abs(t.vAngle)*0.28), dir=t.vAngle>0?1:-1;
+        const prp=angRad+Math.PI/2;
+        const ex=tx+Math.cos(prp)*al*dir, ey=ty+Math.sin(prp)*al*dir;
+        ctx.strokeStyle=urgCfg.fill+Math.round(alpha*180).toString(16).padStart(2,"0");
+        ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(tx,ty); ctx.lineTo(ex,ey); ctx.stroke();
+        ctx.fillStyle=urgCfg.fill+Math.round(alpha*180).toString(16).padStart(2,"0");
+        ctx.beginPath();
+        ctx.moveTo(ex,ey);
+        ctx.lineTo(ex-Math.cos(prp-0.45)*5*dir,ey-Math.sin(prp-0.45)*5*dir);
+        ctx.moveTo(ex,ey);
+        ctx.lineTo(ex-Math.cos(prp+0.45)*5*dir,ey-Math.sin(prp+0.45)*5*dir);
+        ctx.stroke();
+      }
 
-      // ID label small (top)
-      ctx.fillStyle = `rgba(170,170,170,${(0.55*alpha).toFixed(3)})`;
-      ctx.font = "7.5px 'IBM Plex Mono',monospace";
-      ctx.fillText(t.id, tx, ty-16);
-    });
+      // ── Label ──  distance pill below dot, type above
+      const ftStr = toFt(t.dist).toFixed(0)+"ft";
+      const typeStr = t.type==="person"?"PERSON": t.type==="vehicle"?"VEHICLE":"OBJ";
 
-    // Center user (with ring)
-    ctx.beginPath();
-    ctx.arc(cx, cy, 9, 0, Math.PI*2);
-    ctx.strokeStyle = "rgba(32,201,151,0.35)";
-    ctx.lineWidth = 0.5;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cx, cy, 4, 0, Math.PI*2);
-    ctx.fillStyle = "#20C997";
-    ctx.fill();
-    // User label
-    ctx.fillStyle = "rgba(255,255,255,0.55)";
-    ctx.font = "8px 'IBM Plex Mono',monospace";
-    ctx.fillText("YOU", cx, cy+18);
-
-    // Corner crosshairs
-    const tk = 12;
-    ctx.strokeStyle = "rgba(32,201,151,0.35)";
-    ctx.lineWidth = 0.8;
-    [[8,8,1,1],[css-8,8,-1,1],[8,css-8,1,-1],[css-8,css-8,-1,-1]].forEach(([x,y,sx,sy])=>{
+      // Distance pill
+    ctx.font="700 8px 'JetBrains Mono',monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
+      const dw=ctx.measureText(ftStr).width;
+      const pillY=ty+urgCfg.r+10;
+      ctx.fillStyle="rgba(255,255,255,0.84)";
       ctx.beginPath();
-      ctx.moveTo(x, y); ctx.lineTo(x+tk*sx, y);
-      ctx.moveTo(x, y); ctx.lineTo(x, y+tk*sy);
-      ctx.stroke();
+      if(ctx.roundRect) ctx.roundRect(tx-dw/2-4,pillY-6,dw+8,13,3);
+      else ctx.rect(tx-dw/2-4,pillY-6,dw+8,13);
+      ctx.fill();
+      ctx.fillStyle=urgCfg.fill+Math.round(alpha*230).toString(16).padStart(2,"0");
+      ctx.fillText(ftStr, tx, pillY);
+
+      // Type label above (only for larger urgencies)
+      if(t.urgency==="critical"||t.urgency==="high"){
+        ctx.font="600 7px 'JetBrains Mono',monospace";
+        ctx.fillStyle=`rgba(15,23,42,${(0.70*alpha).toFixed(2)})`;
+        ctx.fillText(typeStr, tx, ty-urgCfg.r-8);
+      }
     });
+
+    ctx.setLineDash([]); ctx.lineWidth=1; ctx.globalAlpha=1;
+
+    // ── User dot (center) ──
+    // Heading tick — tiny line pointing forward
+    if(Math.abs(heading)>1){
+      const hRad=(heading-90)*Math.PI/180;
+      const tickLen=14;
+      const g=ctx.createLinearGradient(cx,cy, cx+Math.cos(hRad)*tickLen, cy+Math.sin(hRad)*tickLen);
+      g.addColorStop(0,"rgba(15,157,138,0.65)");
+      g.addColorStop(1,"rgba(15,157,138,0)");
+      ctx.strokeStyle=g; ctx.lineWidth=2; ctx.lineCap="round";
+      ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+Math.cos(hRad)*tickLen,cy+Math.sin(hRad)*tickLen); ctx.stroke();
+      ctx.lineCap="butt";
+    }
+
+    // Outer ring
+    ctx.beginPath(); ctx.arc(cx,cy,11,0,Math.PI*2);
+    ctx.strokeStyle="rgba(15,157,138,0.28)"; ctx.lineWidth=1; ctx.stroke();
+
+    // Inner dot
+    ctx.beginPath(); ctx.arc(cx,cy,5,0,Math.PI*2);
+    const udg=ctx.createRadialGradient(cx-1,cy-1,0,cx,cy,5);
+    udg.addColorStop(0,"#65ead6"); udg.addColorStop(1,"#0f9d8a");
+    ctx.fillStyle=udg; ctx.fill();
+    ctx.strokeStyle="rgba(40,181,212,0.22)"; ctx.lineWidth=1; ctx.stroke();
+
+    // YOU label
+    ctx.font="600 8px 'JetBrains Mono',monospace"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillStyle="rgba(15,157,138,0.68)";
+    ctx.fillText("YOU", cx, cy-20);
+
   },[size]);
 
   useEffect(()=>{
-    let last = performance.now();
-    function tick(now){
-      const dt = now - last; last = now;
-      if(!pausedRef.current && sweepEnabledRef.current){
-        sweepRef.current = (sweepRef.current + dt*(360/5000)) % 360;
+    let last=performance.now();
+    function tick(ts){
+      const dt=ts-last; last=ts;
+      if(!pausedRef.current && sweepEnRef.current)
+        sweepRef.current=(sweepRef.current+dt*(360/5000))%360;
+      // Smooth range lerp — zoom in ~2s, zoom out ~6s
+      const target = targetRangeRef.current;
+      const cur    = rangeRef.current;
+      const diff   = target - cur;
+      if(Math.abs(diff) > 0.05){
+        const base = 0.995; // τ≈200ms — matches threat pool lerp so dots stay at fixed radar fraction
+        const k    = 1 - Math.pow(base, dt);
+        rangeRef.current = Math.min(MAX_RADAR_RANGE_FT, Math.max(MIN_RADAR_RANGE_FT, cur + diff * k));
       }
-      draw();
-      animRef.current = requestAnimationFrame(tick);
+      draw(dt);
+      animRef.current=requestAnimationFrame(tick);
     }
-    animRef.current = requestAnimationFrame(tick);
+    animRef.current=requestAnimationFrame(tick);
     return ()=>cancelAnimationFrame(animRef.current);
   },[draw]);
 
-  // Hit overlay positions for threats (DOM clickable)
   const hits = useMemo(()=>{
-    const cx = size/2, cy = size/2;
-    const maxR = size*0.46;
-    const distMax = 15;
-    return threats.map(t=>{
-      const r = (Math.min(distMax, t.distance)/distMax)*maxR;
-      const angRad = (t.angle - 90)*Math.PI/180;
-      return { id:t.id, threat:t, x: cx + Math.cos(angRad)*r, y: cy + Math.sin(angRad)*r };
+    const hcx=size/2, hcy=size/2, hmR=size*0.445, RFT=displayRange;
+    return visibleThreats.map(t=>{
+      const r=(Math.min(RFT,t.distance*M2FT)/RFT)*hmR;
+      const a=(t.angle-90)*Math.PI/180;
+      return {id:t.id, threat:t, x:hcx+Math.cos(a)*r, y:hcy+Math.sin(a)*r};
     });
-  },[size, threats]);
+  },[size, visibleThreats, displayRange]);
 
   return (
-    <div className="cell area-radar tactical">
+    <div className="cell area-radar" ref={panelRef}>
       <div className="panel-hd">
-        <div className="ttl"><span className="tag">▸</span>SPATIAL RADAR</div>
+        <div className="ttl"><span className="tag">▸</span>Spatial Radar</div>
         <div className="meta">
-          <span>15M</span>
+          <span>{Math.round(displayRange)}ft</span>
           <span>·</span>
           <span className="live">LIVE</span>
         </div>
       </div>
       <div className="radar-wrap" ref={wrapRef}>
-        <canvas ref={canvasRef} className="radar-canvas" width={size} height={size} />
+        <canvas ref={canvasRef} className="radar-canvas" width={size} height={size}/>
         {hits.map(h=>(
-          <div key={h.id}
-            className="threat-hit"
-            style={{left: `calc(50% - ${size/2 - h.x}px)`, top: `calc(${h.y + 14}px)` }}
-            title={`${h.threat.label} · ${h.threat.distance.toFixed(1)}m · ${h.threat.confidence}%`}
+          <div key={h.id} className="threat-hit"
+            style={{left:`calc(50% - ${size/2-h.x}px)`, top:`calc(${h.y+14}px)`}}
+            title={`${h.threat.label} · ${(h.threat.distance*3.28084).toFixed(0)}ft`}
             onClick={()=>onThreatClick(h.threat)}
           />
         ))}
@@ -389,21 +557,21 @@ function RadarPanel({ threats, beams, heading, paused, sweepEnabled, onThreatCli
       <div className="radar-foot">
         <div className="rf">
           <div className="k">Escape</div>
-          <div className="v teal">{heading !== 0 ? Math.round(((heading%360)+360)%360).toString().padStart(3,"0")+"°" : "—"}</div>
+          <div className="v teal">{Math.abs(heading)>2?Math.round(((heading%360)+360)%360).toString().padStart(3,"0")+"°":"—"}</div>
         </div>
         <div className="rf">
           <div className="k">Tracking</div>
-          <div className="v">{threats.length}<span className="u" style={{fontSize:10,color:"var(--tx-3)",marginLeft:4}}>obj</span></div>
+          <div className="v">{visibleThreats.length}<span className="u" style={{fontSize:10,color:"var(--tx-3)",marginLeft:4}}>obj</span></div>
         </div>
         <div className="rf">
           <div className="k">Critical</div>
-          <div className={"v "+(threats.some(t=>t.urgency==="critical")?"red":"")}>
-            {threats.filter(t=>t.urgency==="critical").length}
+          <div className={"v "+(visibleThreats.some(t=>t.urgency==="critical")?"red":"")}>
+            {visibleThreats.filter(t=>t.urgency==="critical").length}
           </div>
         </div>
         <div className="rf">
           <div className="k">Closest</div>
-          <div className="v">{threats.length ? Math.min(...threats.map(t=>t.distance)).toFixed(1) : "—"}<span className="u" style={{fontSize:10,color:"var(--tx-3)",marginLeft:4}}>m</span></div>
+          <div className="v">{visibleThreats.length?(Math.min(...visibleThreats.map(t=>t.distance))*3.28084).toFixed(0):"—"}<span className="u" style={{fontSize:10,color:"var(--tx-3)",marginLeft:4}}>ft</span></div>
         </div>
       </div>
     </div>

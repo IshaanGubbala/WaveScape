@@ -5,10 +5,10 @@ const { useState, useEffect, useRef, useCallback } = React;
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "beamMode": "bars",
   "sweep": true,
-  "scanlines": true,
+  "scanlines": false,
   "spawnRate": "normal",
   "accent": "teal",
-  "theme": "dark",
+  "theme": "light",
   "liveCam": false
 }/*EDITMODE-END*/;
 
@@ -31,9 +31,9 @@ function applyAccent(name, theme){
     r.setProperty("--cyan", a.lightCyan || a.cyan);
     r.setProperty("--teal-dim", a.lightDim || a.dim);
   } else {
-    r.setProperty("--teal", a.hex);
-    r.setProperty("--cyan", a.cyan);
-    r.setProperty("--teal-dim", a.dim);
+    r.setProperty("--teal", "#8ea7ab");
+    r.setProperty("--cyan", "#b3c3cc");
+    r.setProperty("--teal-dim", "#667782");
   }
 }
 
@@ -51,7 +51,7 @@ function App(){
   const [expandedEv, setExpandedEv] = useState(null);
   const [beams, setBeams] = useState({front:.12, right:.05, back:.08, left:.18});
   const [heading, setHeading] = useState(0);
-  const [stat, setStat] = useState({gemma:2.6, pipeline:9.2, yolo:78, temp:42, batt:84});
+  const [stat, setStat] = useState({gemma:2.6, pipeline:9.2, yolo:78, temp:42, cpu_pct:55});
   const [signal, setSignal] = useState(4);
   const [muted, setMuted] = useState(false);
   const [paused, setPaused] = useState(false);
@@ -75,7 +75,7 @@ function App(){
         try{
           const d = JSON.parse(e.data);
           if(d.error) return;
-          if(d.threats   !== undefined) setThreats(d.threats.map(th=>({...th, bornAt: th.bornAt || Date.now(), ttl: th.ttl || 3000, coasting: th.coasting||false, crossing: th.crossing||false, predicted: th.predicted||[], _rx: Date.now()})));
+          if(d.threats   !== undefined) setThreats(d.threats.map(th=>({...th, bornAt: th.bornAt || Date.now(), ttl: th.ttl || 3000, coasting: th.coasting||false, crossing: th.crossing||false, approaching: th.approaching||false, receding: th.receding||false, predicted: th.predicted||[], _rx: Date.now()})));
           if(d.events    !== undefined) setEvents(d.events);
           if(d.beams     !== undefined) setBeams(b=>({...b, ...d.beams}));
           if(d.heading   !== undefined) setHeading(d.heading);
@@ -177,9 +177,9 @@ function App(){
     return ()=>clearInterval(id);
   },[paused, threats]);
 
-  // IMU heading — slow drift
+  // IMU heading — slow drift (sim only; live heading comes from SSE)
   useEffect(()=>{
-    if(paused) return;
+    if(paused || liveConnected) return;
     let h = heading; let v = 0;
     const id = setInterval(()=>{
       v += (Math.random()*2-1)*0.5;
@@ -188,7 +188,7 @@ function App(){
       setHeading(h);
     }, 240);
     return ()=>clearInterval(id);
-  },[paused]); // eslint-disable-line
+  },[paused, liveConnected]); // eslint-disable-line
 
   // System stats — drift
   useEffect(()=>{
@@ -198,7 +198,7 @@ function App(){
         pipeline: Math.max(4.0, Math.min(11, s.pipeline + (Math.random()*2-1)*0.4)),
         yolo:     Math.max(48, Math.min(220, Math.round(s.yolo + (Math.random()*2-1)*8))),
         temp:     Math.max(38, Math.min(64, Math.round(s.temp + (Math.random()*2-1)*0.4))),
-        batt:     Math.max(0, s.batt - (Math.random()<0.05 ? 1 : 0)),
+        cpu_pct:  Math.max(10, Math.min(95, Math.round(s.cpu_pct + (Math.random()*2-1)*5))),
       }));
       if(Math.random()<0.04){ setSignal(s=>Math.max(1,Math.min(4, s + (Math.random()<0.5?-1:1)))); }
     }, 600);
@@ -267,7 +267,7 @@ function App(){
           onClick={()=>setTweak("theme", t.theme==="light"?"dark":"light")}
           title={t.theme==="light"?"Switch to dark mode":"Switch to light mode"}>
           <span className="glyph"/>
-          <span>{t.theme==="light"?"DAY":"NIGHT"}</span>
+          <span>{t.theme==="light"?"LIGHT":"DARK"}</span>
         </button>
         <div className="sep"/>
         <button
@@ -297,7 +297,7 @@ function App(){
           <CameraFeed
             threats={threats}
             yoloDets={yoloDets}
-            fps={Math.round(stat.pipeline*3)}
+            fps={stat.pipeline.toFixed(1)}
             yoloMs={stat.yolo}
             temp={stat.temp}
             heading={heading}

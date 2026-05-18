@@ -35,7 +35,7 @@ SAMPLE_RATE = 48000   # Pi I2S (googlevoicehat) native; Mac falls back via sound
 WINDOW_MS = 500
 HOP_MS = 250
 N_MELS = 64
-MIC_SPACING_M = 0.08   # ~8cm between INMP441 mics on glasses frame
+MIC_SPACING_M = 0.08   # ~8cm between MAX4466 mics on glasses frame
 SPEED_OF_SOUND = 343.0
 
 # Threat-relevant YAMNet class indices (subset)
@@ -131,8 +131,13 @@ class AudioProcessor:
         self._interpreter.allocate_tensors()
 
     def _load_yamnet_labels(self, label_path: str):
-        with open(label_path) as f:
-            self._labels = [line.strip() for line in f]
+        try:
+            with open(label_path) as f:
+                self._labels = [line.strip() for line in f]
+        except (OSError, IOError) as e:
+            import logging
+            logging.getLogger(__name__).warning("YAMNet labels not found: %s", e)
+            self._labels = []
 
     def capture_wav_b64(self, duration_ms: int = 2000) -> Optional[str]:
         """Return last `duration_ms` of audio encoded as base64 WAV for Gemma."""
@@ -236,3 +241,9 @@ class MockAudioProcessor:
 
     def beamform_scan(self, audio=None, directions=None) -> list[dict]:
         return []
+
+    def acoustic_analyze(self, audio=None) -> list:
+        return []
+
+    def capture_wav_b64(self, duration_ms: int = 2000):
+        return None

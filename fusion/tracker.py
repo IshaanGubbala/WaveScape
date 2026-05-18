@@ -3,6 +3,9 @@ Lightweight multi-object tracker using IoU matching across frames.
 Computes velocity, acceleration, and collision ETA per tracked object.
 No external dependencies — pure numpy.
 """
+import logging
+_log = logging.getLogger(__name__)
+
 import time
 import math
 import numpy as np
@@ -14,6 +17,10 @@ from typing import Optional
 MAX_AGE = 5          # frames before track is dropped
 IOU_THRESHOLD = 0.25 # min IoU to match detection to existing track
 MAX_TRACKS = 6
+MOTION_CONFIRM_FRAMES = 5
+MOTION_MIN_HOLD_S = 1.2
+MOTION_ENTER = 0.35
+MOTION_EXIT = 0.18
 
 
 @dataclass
@@ -28,6 +35,9 @@ class TrackState:
     age: int = 0
     missed: int = 0
     first_seen: float = field(default_factory=time.time)
+    motion_state: str = "static"
+    motion_votes: int = 0
+    motion_changed_at: float = 0.0
 
     def update(self, detection: dict) -> None:
         self.history.append({
@@ -85,13 +95,38 @@ class TrackState:
 
     def motion_label(self) -> str:
         v = self.velocity_mps()
+        current = self.motion_state
+        now = time.time()
         if v > 3.0:
-            return "closing-fast"
-        elif v > 0.5:
-            return "closing"
-        elif v < -0.5:
-            return "receding"
-        return "static"
+            target = "closing-fast"
+        elif v > MOTION_ENTER:
+            target = "closing"
+        elif v < -MOTION_ENTER:
+            target = "receding"
+        else:
+            target = "static"
+
+        if current != "static" and target != current and (now - self.motion_changed_at) < MOTION_MIN_HOLD_S:
+            self.motion_votes = 0
+            return current
+
+        if target == current:
+            self.motion_votes = 0
+            return current
+
+        if current in ("closing-fast", "closing") and target == "static":
+            target = current if v > MOTION_EXIT else "static"
+        elif current == "receding" and target == "static":
+            target = current if v < -MOTION_EXIT else "static"
+
+        self.motion_votes += 1
+        if self.motion_votes < MOTION_CONFIRM_FRAMES:
+            return current
+
+        self.motion_votes = 0
+        self.motion_state = target
+        self.motion_changed_at = now
+        return self.motion_state
 
 
 def _iou(a: list, b: list) -> float:
@@ -140,6 +175,19 @@ class ObjectTracker:
                         iou = 0.0
                 else:
                     iou = _iou(det["bbox"], trk.bbox)
+                    # Fast-moving objects may have low IoU even when matching.
+                    # Use center proximity as a secondary signal to avoid spawning
+                    # duplicate tracks for the same object moving quickly.
+                    if iou < IOU_THRESHOLD:
+                        db = det["bbox"]
+                        tb = trk.bbox
+                        dcx = (db[0] + db[2]) / 2
+                        dcy = (db[1] + db[3]) / 2
+                        tcx = (tb[0] + tb[2]) / 2
+                        tcy = (tb[1] + tb[3]) / 2
+                        center_dist = math.hypot(dcx - tcx, dcy - tcy)
+                        if center_dist < 44:  # ~20% of 224px image
+                            iou = IOU_THRESHOLD  # just enough to match
                 if iou > best_iou:
                     best_iou, best_di = iou, di
             if best_iou >= IOU_THRESHOLD and best_di >= 0:
@@ -164,25 +212,46 @@ class ObjectTracker:
                     bbox=det.get("bbox", []),
                 )
                 trk.update(det)
+                trk.motion_state = "static"
+                trk.motion_votes = 0
+                trk.motion_changed_at = time.time()
                 self._tracks.append(trk)
                 self._next_id += 1
 
-        # Prune dead tracks
+        # Prune dead tracks; prioritize approaching over receding
         self._tracks = [t for t in self._tracks if t.missed < MAX_AGE]
-        self._tracks = sorted(self._tracks, key=lambda t: t.confidence, reverse=True)[:MAX_TRACKS]
+
+        def _priority(t: TrackState) -> float:
+            v = t.velocity_mps()
+            if v > 0.5:     # clearly approaching
+                mul = 1.6
+            elif v > 0.1:   # weakly approaching / static
+                mul = 1.1
+            elif v < -1.0:  # fast-receding — deprioritize strongly
+                mul = 0.2
+            elif v < -0.3:  # gently receding
+                mul = 0.5
+            else:
+                mul = 1.0
+            return t.confidence * mul
+
+        self._tracks = sorted(self._tracks, key=_priority, reverse=True)[:MAX_TRACKS]
 
         # Build enriched output
         return self._enrich(detections)
 
     def _enrich(self, detections: list[dict]) -> list[dict]:
         """Add velocity/eta/motion_label to each detection from matched track."""
+        # Build label index once — O(N+M) instead of O(N×M)
+        trk_by_label: dict[str, list] = {}
+        for trk in self._tracks:
+            trk_by_label.setdefault(trk.label, []).append(trk)
+
         enriched = []
         for det in detections:
             best_trk = None
             best_score = -1
-            for trk in self._tracks:
-                if trk.label != det["label"]:
-                    continue
+            for trk in trk_by_label.get(det["label"], []):
                 angle_diff = abs(trk.direction_deg - det["direction_deg"]) % 360
                 angle_diff = min(angle_diff, 360 - angle_diff)
                 score = trk.confidence - angle_diff / 180
@@ -190,10 +259,15 @@ class ObjectTracker:
                     best_score, best_trk = score, trk
             d = dict(det)
             if best_trk and best_trk.age >= 2:
-                d["velocity_mps"] = round(best_trk.velocity_mps(), 2)
+                v = best_trk.velocity_mps()
+                d["velocity_mps"] = round(v, 2)
                 d["eta_s"] = round(best_trk.eta_seconds(), 1) if best_trk.eta_seconds() else None
                 d["motion"] = best_trk.motion_label()
                 d["track_age"] = best_trk.age
+                # Lead correction: bbox is from ~2 frames ago at 10fps → 0.2s lag.
+                # Approaching objects appear further than they are by v*lag.
+                if v > 0.1 and "distance_m" in d:
+                    d["distance_m"] = round(max(0.3, d["distance_m"] - v * 0.08), 2)
             enriched.append(d)
         return enriched
 

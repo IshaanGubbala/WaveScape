@@ -17,9 +17,12 @@ Usage:
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 try:
     import requests as _requests
@@ -33,9 +36,10 @@ try:
 except ImportError:
     _HAS_WS = False
 
-MAC_HOST        = "100.75.147.6"   # Mac Tailscale IP (LAN unreachable when on different networks)
-MAC_WS_URL      = f"ws://{MAC_HOST}:8084/ws"
-MAC_HTTP_URL    = f"http://{MAC_HOST}:8083"
+import os as _os
+MAC_HOST        = _os.environ.get("MAC_HOST",     "100.75.147.6")
+MAC_WS_URL      = _os.environ.get("MAC_WS_URL",  f"ws://{MAC_HOST}:8084")
+MAC_HTTP_URL    = _os.environ.get("MAC_HTTP_URL", f"http://{MAC_HOST}:8083")
 RESULT_TTL_S    = 4.0    # treat cached result stale after this
 HTTP_TIMEOUT_S  = 2.5
 UPDATE_MIN_S    = 0.1    # max 10 sensor pushes/sec even if called every frame
@@ -71,9 +75,9 @@ class MacSceneOffload:
             t = threading.Thread(target=self._run_ws_loop, daemon=True)
             t.start()
         elif _HAS_REQUESTS:
-            print("[mac_offload] websockets not installed — using HTTP fallback")
+            _log.warning("websockets not installed — using HTTP fallback")
         else:
-            print("[mac_offload] neither websockets nor requests installed — disabled")
+            _log.error("neither websockets nor requests installed — Mac offload disabled")
 
     # ── public API (unchanged from HTTP version) ──────────────────────────────
 
@@ -134,14 +138,15 @@ class MacSceneOffload:
             try:
                 async with _ws_lib.connect(
                     self._ws_url,
-                    ping_interval=WS_PING_S,
-                    ping_timeout=WS_PING_S * 2,
+                    ping_interval=None,   # disable pings (v12/v16 compat)
+                    ping_timeout=None,
                     open_timeout=5.0,
+                    close_timeout=5.0,
                 ) as ws:
                     with self._lock:
                         self._ws_connected = True
                         self._fail_count   = 0
-                    print(f"[mac_offload] WS connected → {self._ws_url}")
+                    _log.info("WS connected → %s", self._ws_url)
 
                     sender   = asyncio.create_task(self._sender(ws))
                     receiver = asyncio.create_task(self._receiver(ws))
@@ -162,7 +167,7 @@ class MacSceneOffload:
                     self._fail_count  += 1
                 fc = self._fail_count
                 if fc <= 3 or fc % 20 == 0:
-                    print(f"[mac_offload] WS disconnected: {e}  (attempt {fc})")
+                    _log.warning("WS disconnected: %s (attempt %d)", e, fc)
                 await asyncio.sleep(WS_RECONNECT_S)
 
     async def _sender(self, ws) -> None:
@@ -186,11 +191,12 @@ class MacSceneOffload:
                         self._result = data
                     self._result_ts = time.time()
                 if msg_type == "alert":
-                    print(f"  [mac_offload] ALERT ← {data.get('gemma_scene','')}")
+                    _log.info("ALERT ← %s", data.get("gemma_scene", ""))
                 else:
-                    print(f"  [mac_offload] scene ← {data.get('summary','')}  "
-                          f"objs={len(data.get('scene_objects',[]))}  "
-                          f"lat={data.get('latency_ms',0):.0f}ms")
+                    _log.debug("scene ← %s  objs=%d  lat=%.0fms",
+                               data.get("summary", ""),
+                               len(data.get("scene_objects", [])),
+                               data.get("latency_ms", 0))
 
     def _enqueue(self, msg: dict) -> None:
         """Called on WS asyncio loop via call_soon_threadsafe."""
@@ -218,10 +224,11 @@ class MacSceneOffload:
                 with self._lock:
                     self._result    = data
                     self._result_ts = time.time()
-                print(f"  [mac_offload] HTTP ← {data.get('summary','')}  "
-                      f"lat={data.get('latency_ms',0):.0f}ms")
+                _log.debug("HTTP ← %s  lat=%.0fms",
+                           data.get("summary", ""), data.get("latency_ms", 0))
         except Exception as e:
             with self._lock:
                 self._fail_count += 1
-            if self._fail_count <= 3 or self._fail_count % 20 == 0:
-                print(f"  [mac_offload] HTTP failed: {e}")
+            fc = self._fail_count
+            if fc <= 3 or fc % 20 == 0:
+                _log.warning("HTTP failed: %s", e)
